@@ -144,6 +144,13 @@ PAGE = r"""<!doctype html>
   .ctl label { font-size:13.5px; }
   .ctl label small { color:var(--muted); display:block; font-size:11.5px; font-weight:400; }
   .ctl input[type=range] { width:100%; accent-color:var(--accent); }
+  .presets { display:flex; align-items:center; gap:8px; margin:-6px 0 16px; flex-wrap:wrap; }
+  .presets .plabel { font-size:11px; color:var(--muted); text-transform:uppercase;
+    letter-spacing:.05em; }
+  .preset { font:inherit; font-size:12px; padding:4px 12px; border-radius:999px; cursor:pointer;
+    border:1px solid var(--line); background:var(--card); color:var(--ink); }
+  .preset:hover { border-color:var(--accent); }
+  .preset.on { background:var(--accent); border-color:var(--accent); color:#fff; }
   .ctl output { font-weight:700; font-variant-numeric:tabular-nums; text-align:right;
     font-size:15px; }
   .ultra { display:flex; align-items:flex-start; gap:12px; margin-top:8px; padding:14px 16px;
@@ -211,6 +218,29 @@ PAGE = r"""<!doctype html>
   </div>
 <script>
 var MODEL = __DATA__;
+
+// Model burn factors, derived from Anthropic's published API pricing (per MTok
+// in/out): Fable 5 $10/$50, Opus 5 & Opus 4.8 $5/$25, Sonnet 5 $3/$15. The input
+// and output ratios agree exactly, so the factor is unambiguous: Fable = 2.0x
+// Opus, Sonnet = 0.6x. Baseline 1.0 is Opus - the tier most measured burn
+// history is recorded on.
+var MODELS = [
+  { name: "Fable", mult: 2.0 },
+  { name: "Opus", mult: 1.0 },
+  { name: "Sonnet", mult: 0.6 }
+];
+// Effort stops modulate token *volume*, not per-token price - Anthropic
+// publishes no cost figures for them, so these are estimates relative to Extra
+// (xhigh), Claude Code's default. Ultracode is multi-agent orchestration on top
+// of max effort (~2.5x).
+var EFFORTS = [
+  { name: "Low", mult: 0.4 },
+  { name: "Medium", mult: 0.6 },
+  { name: "High", mult: 0.8 },
+  { name: "Extra", mult: 1.0 },
+  { name: "Max", mult: 1.4 },
+  { name: "Ultracode", mult: 2.5 }
+];
 
 function fmtHours(h) {
   if (h === null || h === undefined) return "—";
@@ -441,12 +471,26 @@ function render() {
   if (!MODEL || !MODEL.available) { renderOnboarding(app); return; }
   var five = MODEL.five_hour, seven = MODEL.seven_day;
 
-  // read controls (default: assume the recent burn continues only during
-  // "active hours/day"; Ultracode multiplies the burn rate).
-  var activeHours = parseFloat(document.getElementById("f-active") ?
-      document.getElementById("f-active").value : 6);
-  var ultra = parseFloat(document.getElementById("f-ultra") ?
-      document.getElementById("f-ultra").value : 1);
+  // read controls. On first paint the inputs don't exist yet, so restore the
+  // last session's values from localStorage (falling back to defaults: Opus at
+  // Extra effort = 1.0x, the measured baseline). Every paint writes them back,
+  // so the settings stay sticky across reloads/sessions.
+  var aEl = document.getElementById("f-active");
+  var eEl = document.getElementById("f-effort");
+  var sActive = parseFloat(localStorage.getItem("usage.activeHours"));
+  var sEffort = parseInt(localStorage.getItem("usage.effort"), 10);
+  var activeHours = aEl ? parseFloat(aEl.value) : (isFinite(sActive) ? sActive : 6);
+  var effortIdx = eEl ? parseInt(eEl.value, 10) : (isFinite(sEffort) ? sEffort : 3);
+  effortIdx = Math.min(Math.max(effortIdx, 0), EFFORTS.length - 1);
+  var modelName = localStorage.getItem("usage.model") || "Opus";
+  var model = MODELS.filter(function (m) { return m.name === modelName; })[0] || MODELS[1];
+  var effort = EFFORTS[effortIdx];
+  var ultra = model.mult * effort.mult;   // effective burn = model x effort
+  try {
+    localStorage.setItem("usage.activeHours", activeHours);
+    localStorage.setItem("usage.effort", effortIdx);
+    localStorage.setItem("usage.model", model.name);
+  } catch (e) { /* private mode / storage off - just don't persist */ }
 
   // Effective weekly burn: the measured pts/hr, scaled by how much of each day
   // you're actually in sessions, times the Ultracode multiplier. The measured
@@ -471,7 +515,7 @@ function render() {
   }, sevenState);
 
   // Ultracode read-out: what does flipping it on do to the weekly window?
-  var ultraOn = project(seven.pct, seven.rate_per_h * (activeHours / 24) * 2.5,
+  var ultraOn = project(seven.pct, seven.rate_per_h * (activeHours / 24) * model.mult * 2.5,
                         seven.hours_to_reset);
   var ultraMsg;
   if (seven.pct >= 99) {
@@ -491,6 +535,11 @@ function render() {
       ? ' Last week you hit 100% before the reset — the model is calibrated to that pace.'
       : (prevPeak != null ? (' Last completed week peaked at ~' + Math.round(prevPeak) + '%.') : '');
 
+  var modelBtns = MODELS.map(function (m) {
+    var on = m.name === model.name ? " on" : "";
+    return '<button type="button" class="preset' + on + '" data-model="' + m.name + '">' + m.name + '</button>';
+  }).join("");
+
   app.innerHTML =
     verdictBand(worst, fiveState, sevenState) +
     '<div class="cols">' + fivePanel + sevenPanel + '</div>' +
@@ -499,15 +548,23 @@ function render() {
       '<span><i class="swatch" style="background:var(--warn)"></i>7-day window</span></div>' +
       '<canvas id="chart"></canvas></div>' +
     '<div class="controls"><h2>Model a change</h2>' +
-      '<div class="hint">The burn rate above is measured from your recent sessions. ' +
-      'Adjust how much you plan to keep working and whether Ultracode is on — the ' +
-      'weekly projection updates live.' + prevNote + '</div>' +
+      '<div class="hint">The burn rate above is measured from your recent sessions — ' +
+      'the multipliers below are relative to that baseline (assumed Opus at Extra ' +
+      'effort, Claude Code’s default). Pick the model and effort you plan to run ' +
+      'and the projection updates live. Model ratios come from Anthropic’s ' +
+      'published pricing; effort ratios are estimates.' + prevNote + '</div>' +
       '<div class="ctl"><label>Active hours / day<small>time actually in sessions</small></label>' +
         '<input type="range" id="f-active" min="0.5" max="16" step="0.5" value="' + activeHours + '">' +
         '<output>' + activeHours + ' h</output></div>' +
-      '<div class="ctl"><label>Burn multiplier<small>1× normal · ~2.5× Ultracode</small></label>' +
-        '<input type="range" id="f-ultra" min="1" max="4" step="0.1" value="' + ultra + '">' +
-        '<output>' + ultra.toFixed(1) + '×</output></div>' +
+      '<div class="ctl"><label>Model<small>Fable 2× · Opus 1× · Sonnet 0.6× (published pricing)</small></label>' +
+        '<div class="presets" style="margin:0">' + modelBtns + '</div>' +
+        '<output>' + model.mult.toFixed(1) + '×</output></div>' +
+      '<div class="ctl"><label>Effort<small>Low · Medium · High · Extra · Max · Ultracode</small></label>' +
+        '<input type="range" id="f-effort" min="0" max="' + (EFFORTS.length - 1) + '" step="1" value="' + effortIdx + '">' +
+        '<output>' + effort.name + '</output></div>' +
+      '<div class="presets"><span class="plabel">Effective burn</span><b>' + ultra.toFixed(1) + '×</b>' +
+        '<span class="plabel" style="text-transform:none;letter-spacing:0">= ' + model.name + ' ' +
+        model.mult.toFixed(1) + ' × ' + effort.name + ' ' + effort.mult.toFixed(1) + '</span></div>' +
       '<div class="ultra"><div class="u-ic">U</div><div class="u-body">' +
         '<b>Ultracode check.</b> ' + ultraMsg + '</div></div>' +
     '</div>';
@@ -515,9 +572,16 @@ function render() {
   drawChart(MODEL.history);
 
   // rewire the sliders (innerHTML replaced them)
-  ["f-active", "f-ultra"].forEach(function (id) {
+  ["f-active", "f-effort"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener("input", render);
+  });
+  // model chips persist the choice and re-project
+  Array.prototype.forEach.call(document.querySelectorAll(".preset"), function (b) {
+    b.addEventListener("click", function () {
+      try { localStorage.setItem("usage.model", b.getAttribute("data-model")); } catch (e) {}
+      render();
+    });
   });
 }
 

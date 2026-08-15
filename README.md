@@ -48,10 +48,33 @@ python3 serve.py --no-open       # don't launch a browser
   each with how much you've used, your current burn rate, when it resets, and
   where you're projected to land by then.
 - **A 72‑hour chart** of both windows.
-- **"Model a change"** sliders: how many hours a day you plan to keep working,
-  and a burn multiplier — with an **Ultracode** read‑out. (Ultracode isn't a plan
-  upgrade; it's an effort mode that burns roughly 2.5× faster. The tool tells you
-  whether your weekly budget can absorb it before the reset.)
+- **"Model a change"** what‑if controls: how many hours a day you plan to keep
+  working, which **model** you'll run (Fable / Opus / Sonnet), and at what
+  **effort** (Low → Medium → High → Extra → Max → Ultracode). Effective burn is
+  model × effort, and the weekly projection updates live. Your choices persist
+  across sessions.
+- An **Ultracode** read‑out on top of that: Ultracode isn't a plan upgrade, it's
+  multi‑agent orchestration that burns roughly 2.5× faster. The tool tells you
+  whether your weekly budget can absorb it before the reset — on whichever model
+  you've selected.
+
+### About the multipliers
+
+Everything is relative to a baseline of **1.0 = Opus at Extra effort** (`xhigh`,
+Claude Code's default) — the configuration most measured burn history is
+recorded on.
+
+**Model factors come from Anthropic's published API pricing** (per million
+tokens, input/output): Fable 5 at $10/$50, Opus 5 and Opus 4.8 at $5/$25, and
+Sonnet 5 at $3/$15. The input and output ratios agree exactly, so the factors are
+unambiguous — Fable is **2.0×** Opus and Sonnet is **0.6×**.
+
+**Effort factors are estimates.** Effort changes how many tokens a task consumes,
+not the per‑token price, and Anthropic publishes no cost figures for effort
+levels — so these are calibrated by observation rather than derived from a price
+list. They live in one place (`EFFORTS` near the top of the page script in
+`usage_page.py`) and are a one‑line change each if your own usage suggests
+different ratios.
 
 ## Where the data comes from
 
