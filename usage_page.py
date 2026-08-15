@@ -404,7 +404,7 @@ function renderOnboarding(app) {
           "Otherwise grab it from <a href=\"https://claude.com/claude-code\" target=\"_blank\" rel=\"noopener\">claude.com/claude-code</a>.") +
         stepHTML(step2state, "Let it record your usage once",
           "In any Claude Code session, run <code>/usage</code>. That makes Claude Code " +
-          "start sampling your 5-hour and 7-day limits (about every 15 minutes) to a " +
+          "start sampling your 5-hour and 7-day limits (about every 5 minutes) to a " +
           "local file. You only need to do this once; it keeps updating after.") +
         stepHTML("wait", "This page picks it up automatically",
           "<span id=\"poll-msg\">Watching for your usage file&hellip;</span> " +
@@ -442,7 +442,7 @@ function stepHTML(state, title, body) {
 var _pollTimer = null, _polling = false;
 function startPolling() {
   if (_pollTimer) return;
-  _pollTimer = setInterval(pollNow, 8000);   // gentle - the file updates ~15 min
+  _pollTimer = setInterval(pollNow, 8000);   // gentle - the file updates ~5 min
 }
 function pollNow() {
   if (_polling) return;

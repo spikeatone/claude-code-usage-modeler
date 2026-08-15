@@ -2,7 +2,7 @@
 """Claude Code usage modeler - read local /usage history and project it forward.
 
 The dashboard's other panels are about the apps; this one is about the tool
-that builds them. Claude Code samples the `/usage` limit bars every ~15 minutes
+that builds them. Claude Code samples the `/usage` limit bars every ~5 minutes
 and persists them to
 
     ~/Library/Application Support/Claude/plan-usage-history.json

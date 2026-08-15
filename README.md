@@ -78,7 +78,7 @@ different ratios.
 
 ## Where the data comes from
 
-Claude Code samples your `/usage` limits every ~15 minutes to a local file. The
+Claude Code samples your `/usage` limits every ~5 minutes to a local file. The
 tool looks for it here (first match wins):
 
 - macOS: `~/Library/Application Support/Claude/plan-usage-history.json`
