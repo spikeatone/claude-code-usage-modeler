@@ -132,13 +132,25 @@ def test_wtd_rate_too_early_is_none():
 
 
 def test_band_for_picks_bucket():
-    band = {"96": 48.0, "48": 37.0, "24": 30.0, "0": 20.0}
-    assert U._band_for(band, 100) == 48.0
-    assert U._band_for(band, 60) == 37.0
-    assert U._band_for(band, 30) == 30.0
-    assert U._band_for(band, 5) == 20.0
+    band = {"96": {"lo": -43.0, "hi": 61.0}, "48": {"lo": -39.0, "hi": 24.0},
+            "24": {"lo": -40.0, "hi": 17.0}, "0": {"lo": -23.0, "hi": -7.0}}
+    assert U._band_for(band, 100)["hi"] == 61.0
+    assert U._band_for(band, 60)["lo"] == -39.0
+    assert U._band_for(band, 30)["hi"] == 17.0
+    assert U._band_for(band, 5)["lo"] == -23.0
     assert U._band_for(band, None) is None
     assert U._band_for(None, 5) is None
+
+
+def test_max_gain_over_ignores_reset_drops():
+    # 0->40 climb, reset to 0, 0->30 climb. Max gain over a long stretch must
+    # be 40 (within one window), never 70 (across the reset).
+    samples = [_s(0, 0, 0), _s(10, 0, 40), _s(11, 0, 2), _s(20, 0, 30)]
+    g = U._max_gain_over(samples, [11 * H], 100)
+    assert g == 40.0, g
+    # short stretch: only what fits in the duration
+    g2 = U._max_gain_over(samples, [11 * H], 9)
+    assert g2 <= 40.0 and g2 >= 28.0, g2
 
 
 def test_fh_window_start_from_idle_climb():

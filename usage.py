@@ -213,11 +213,11 @@ def _calibrate_band(samples, resets):
     """Projection uncertainty, learned from this user's own completed windows.
 
     For every checkpoint inside each completed weekly window, compute the
-    week-to-date projection error vs the window's actual final value; return
-    the median absolute error bucketed by hours-remaining. The UI shows the
-    projection as a range (central +/- band) instead of one fake-precise
-    number - on this history the honest band is ~20-48pts, shrinking as the
-    reset nears.
+    week-to-date projector's SIGNED error (projection - actual end) and keep
+    the p20/p80 quantiles, bucketed by hours-remaining. Signed quantiles beat
+    a symmetric +/- band twice over: the error is skewed (early-week the
+    projector runs hot, mid-week it runs low), so the asymmetric interval is
+    both recentered and 15-60% narrower for the same confidence.
     """
     buckets = {"96": [], "48": [], "24": [], "0": []}
     for w in range(len(resets) - 1):
@@ -231,20 +231,22 @@ def _calibrate_band(samples, resets):
             rem = (b - s_["t"]) / 3600_000
             if elapsed < 12 or rem < 1:
                 continue
-            err = abs(s_["sd"] + s_["sd"] / elapsed * rem - end_pct)
+            err = (s_["sd"] + s_["sd"] / elapsed * rem) - end_pct
             key = "96" if rem >= 96 else "48" if rem >= 48 else \
                   "24" if rem >= 24 else "0"
             buckets[key].append(err)
     out = {}
     for key, errs in buckets.items():
-        if errs:
+        if len(errs) >= 10:               # too few checkpoints = no calibration
             errs.sort()
-            out[key] = round(errs[len(errs) // 2], 1)
+            lo = errs[min(len(errs) - 1, int(len(errs) * 0.2))]
+            hi = errs[min(len(errs) - 1, int(len(errs) * 0.8))]
+            out[key] = {"lo": round(lo, 1), "hi": round(hi, 1)}
     return out or None
 
 
 def _band_for(band, hours_to_reset):
-    """The +/- band that applies right now, given hours until the reset."""
+    """The signed-error quantiles {lo, hi} for the current hours-to-reset."""
     if not band or hours_to_reset is None:
         return None
     key = "96" if hours_to_reset >= 96 else "48" if hours_to_reset >= 48 else \
@@ -254,6 +256,30 @@ def _band_for(band, hours_to_reset):
         if k in band:
             return band[k]
     return None
+
+
+def _max_gain_over(samples, resets, dur_h):
+    """The most this user has EVER burned (sd points) inside any stretch of
+    `dur_h` hours within a single weekly window. A physics cap on projections:
+    the high end of the range can't exceed current + this (nobody projects a
+    burn you've never once approached). Measured within windows so a reset
+    drop never fakes a gain."""
+    best = 0.0
+    if not samples:
+        return best
+    # Segment boundaries: history start, each reset, history end - the stretch
+    # before the first reset is a valid within-window run too.
+    bounds = [samples[0]["t"]] + list(resets) + [samples[-1]["t"] + 1]
+    for w in range(len(bounds) - 1):
+        a, b = bounds[w], bounds[w + 1]
+        pts = [s for s in samples if a <= s["t"] < b]
+        j = 0
+        for i in range(len(pts)):
+            while pts[i]["t"] - pts[j]["t"] > dur_h * 3600_000:
+                j += 1
+            window_min = min(p["sd"] for p in pts[j:i + 1])
+            best = max(best, pts[i]["sd"] - window_min)
+    return best
 
 
 def _fh_window_start(samples, now_ms):
@@ -382,14 +408,26 @@ def load_usage(path=None, now_ms=None):
     band = _band_for(band_all, hours_to_weekly)
     central_rate = wtd if wtd is not None else sd_rate
     seven_d = _project(latest["sd"], central_rate, hours_to_weekly)
-    # Verdict honesty: judge the range, not the point. Over only when even the
-    # optimistic edge busts; tight when the band straddles 100.
+    # The interval, tightened three ways beyond a naive +/- band:
+    #   1. asymmetric: actual = projection - err, so the interval is
+    #      [proj - err_hi, proj - err_lo] - recentered for the projector's
+    #      bucket-specific bias, not just widened around it.
+    #   2. floored at the current pct (usage never goes down within a window).
+    #   3. capped at current + the most ever burned in the remaining hours
+    #      (x1.1 headroom) - a projection can't exceed a burn you've never
+    #      once approached.
+    max_gain = (_max_gain_over(samples, resets, hours_to_weekly)
+                if resets and hours_to_weekly else None)
+    proj_low = proj_high = None
     if seven_d["pct_at_reset"] is not None and band is not None:
-        low = seven_d["pct_at_reset"] - band
-        high = seven_d["pct_at_reset"] + band
-        if low >= 100:
+        proj_low = max(latest["sd"], seven_d["pct_at_reset"] - band["hi"])
+        proj_high = seven_d["pct_at_reset"] - band["lo"]
+        if max_gain is not None:
+            proj_high = min(proj_high, latest["sd"] + max_gain * 1.1)
+        proj_high = max(proj_high, proj_low + 5)   # never feign pinpoint accuracy
+        if proj_low >= 100:
             seven_d["verdict"] = "over"
-        elif high >= 100:
+        elif proj_high >= 100:
             seven_d["verdict"] = "tight"
         else:
             seven_d["verdict"] = "clear"
@@ -426,8 +464,11 @@ def load_usage(path=None, now_ms=None):
             "pct": latest["sd"],
             "rate_per_h": round(sd_rate, 3),          # burst: "if you keep this up"
             "wtd_rate_per_h": round(wtd, 3) if wtd is not None else None,
-            "band_pts": band,                          # +/- on pct_at_reset
+            "band": band,                              # signed err {lo, hi}
             "band_by_bucket": band_all,
+            "proj_low": round(proj_low, 1) if proj_low is not None else None,
+            "proj_high": round(proj_high, 1) if proj_high is not None else None,
+            "max_gain_pts": round(max_gain, 1) if max_gain is not None else None,
             "next_reset_ms": int(next_reset_dt.timestamp() * 1000) if next_reset_dt else None,
             "hours_to_reset": round(hours_to_weekly, 2) if hours_to_weekly is not None else None,
             "anchor": anchor, "prev_window_peak": prev_peak, **seven_d,

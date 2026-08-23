@@ -269,24 +269,36 @@ function classFor(v) { return v === "over" ? "over" : (v === "tight" ? "tight" :
 // in usage.py. `bandPts` is the calibrated +/- uncertainty (from the server's
 // backtest of this user's own history); when given, the verdict judges the
 // RANGE, not the point: over only when even the optimistic edge busts.
-function project(pct, ratePerH, hoursToReset, bandPts) {
+function project(pct, ratePerH, hoursToReset, band, maxGain, mult) {
   var remaining = Math.max(0, 100 - pct);
   var hoursToFull = ratePerH <= 0.0001 ? null : remaining / ratePerH;
   var pctAtReset = (hoursToReset == null) ? null :
       (ratePerH <= 0.0001 ? pct : pct + ratePerH * hoursToReset);
+  // The interval: actual = projection - err, so [proj-err_hi, proj-err_lo]
+  // (asymmetric, recentered for the projector's measured bias), floored at
+  // the current pct and capped at the most ever burned in the remaining
+  // hours - scaled by the what-if multiplier, since modeling a heavier
+  // configuration can legitimately out-burn history.
+  var low = null, high = null;
+  if (band != null && pctAtReset != null) {
+    low = Math.max(pct, pctAtReset - band.hi);
+    high = pctAtReset - band.lo;
+    if (maxGain != null) high = Math.min(high, pct + maxGain * 1.1 * (mult || 1));
+    high = Math.max(high, low + 5);
+  }
   var verdict;
   if (hoursToReset == null) verdict = "unknown";
   else if (hoursToFull === null) verdict = "clear";
-  else if (bandPts != null && pctAtReset != null) {
-    if (pctAtReset - bandPts >= 100) verdict = "over";
-    else if (pctAtReset + bandPts >= 100) verdict = "tight";
+  else if (low != null) {
+    if (low >= 100) verdict = "over";
+    else if (high >= 100) verdict = "tight";
     else verdict = "clear";
   }
   else if (hoursToFull >= hoursToReset * 1.15) verdict = "clear";
   else if (hoursToFull >= hoursToReset) verdict = "tight";
   else verdict = "over";
   return { hoursToFull: hoursToFull, pctAtReset: pctAtReset, verdict: verdict,
-           bandPts: bandPts == null ? null : bandPts };
+           low: low, high: high };
 }
 
 function barHTML(pct, projPct, cls) {
@@ -302,13 +314,11 @@ function barHTML(pct, projPct, cls) {
 function panelHTML(title, meta, state) {
   var cls = classFor(state.verdict);
   var projShow = state.pctAtReset == null ? null : Math.round(state.pctAtReset);
-  var band = state.bandPts == null ? null : Math.round(state.bandPts);
   var projLabel;
-  if (projShow == null) projLabel = "—";
-  else if (band != null) {
-    // The honest read: a calibrated range, not one fake-precise number.
-    var lo = Math.max(0, projShow - band), hi = projShow + band;
-    projLabel = lo + "–" + Math.min(hi, 200) + "%" +
+  if (projShow == null) projLabel = "\u2014";
+  else if (state.low != null) {
+    // The honest read: a calibrated, physics-capped range.
+    projLabel = Math.round(state.low) + "\u2013" + Math.round(state.high) + "%" +
         (projShow > 100 ? " (mid " + projShow + ")" : "");
   }
   else projLabel = projShow > 100 ? ("~" + projShow + "% — over by " + (projShow - 100)) : ("~" + projShow + "%");
@@ -527,7 +537,7 @@ function render() {
       ? Math.min(16, Math.max(0.5, wtdRate / burst * 24)) : 6;
   if (!aEl && !isFinite(sActive)) activeHours = Math.round(impliedActive * 2) / 2;
   var sevenRateEff = wtdRate * (activeHours / impliedActive) * mult;
-  var sevenState = project(seven.pct, sevenRateEff, seven.hours_to_reset, seven.band_pts);
+  var sevenState = project(seven.pct, sevenRateEff, seven.hours_to_reset, seven.band, seven.max_gain_pts, mult);
   // 5-hour window: the current burst, scaled only by model x effort (it's a
   // live burst), over the REAL remaining horizon - the server estimates when
   // this window opened, so we no longer project a fresh 5 hours every render.
@@ -558,7 +568,7 @@ function render() {
       ? ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][new Date(seven.next_reset_ms).getDay()]
       : "the reset";
   var ultraOn = project(seven.pct, wtdRate * (activeHours / impliedActive) * model.mult * 2.5,
-                        seven.hours_to_reset, seven.band_pts);
+                        seven.hours_to_reset, seven.band, seven.max_gain_pts, model.mult * 2.5);
   var ultraMsg;
   if (seven.pct >= 99) {
     ultraMsg = 'You&rsquo;re at the weekly cap now — Ultracode has nothing left to spend until ' + resetDay + '.';
