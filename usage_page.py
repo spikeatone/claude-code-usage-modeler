@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """The Claude Code usage modeler page.
 
-Rendered at /usage by serve.py from the model that usage.load_usage() builds off
-the local `/usage` history.
+Rendered at / by serve.py from the model that usage.load_usage()
+builds off the local `/usage` history. The page is deliberately in the same
+visual system as the portfolio dashboard (same tokens, same card language) so it
+reads as one more panel of the same tool - just pointed at the tool itself
+rather than the apps.
 
 The question it answers: at my current burn, do I run out before the window
 resets? And the two levers that change that answer - how many more hours I sit
@@ -69,6 +72,11 @@ PAGE = r"""<!doctype html>
   .back { font-size:13px; text-decoration:none; }
   .sub { color:var(--muted); font-size:13px; margin-bottom:22px; }
   .tabnum { font-variant-numeric:tabular-nums; }
+
+  .stale-banner { border-radius:12px; padding:12px 18px; margin-bottom:16px;
+    background:var(--review-bg); color:var(--review); font-size:13.5px;
+    border:1px solid transparent; }
+  .stale-banner b { color:var(--review); }
 
   /* Verdict band */
   .verdict { border-radius:16px; padding:20px 24px; margin-bottom:24px;
@@ -144,6 +152,8 @@ PAGE = r"""<!doctype html>
   .ctl label { font-size:13.5px; }
   .ctl label small { color:var(--muted); display:block; font-size:11.5px; font-weight:400; }
   .ctl input[type=range] { width:100%; accent-color:var(--accent); }
+  .ctl output { font-weight:700; font-variant-numeric:tabular-nums; text-align:right;
+    font-size:15px; }
   .presets { display:flex; align-items:center; gap:8px; margin:-6px 0 16px; flex-wrap:wrap; }
   .presets .plabel { font-size:11px; color:var(--muted); text-transform:uppercase;
     letter-spacing:.05em; }
@@ -151,8 +161,6 @@ PAGE = r"""<!doctype html>
     border:1px solid var(--line); background:var(--card); color:var(--ink); }
   .preset:hover { border-color:var(--accent); }
   .preset.on { background:var(--accent); border-color:var(--accent); color:#fff; }
-  .ctl output { font-weight:700; font-variant-numeric:tabular-nums; text-align:right;
-    font-size:15px; }
   .ultra { display:flex; align-items:flex-start; gap:12px; margin-top:8px; padding:14px 16px;
     border-radius:12px; background:var(--dev-bg); border:1px solid transparent; }
   .ultra .u-ic { width:30px; height:30px; border-radius:8px; flex:none; display:grid;
@@ -164,7 +172,6 @@ PAGE = r"""<!doctype html>
   footer { color:var(--muted); font-size:12px; margin-top:26px; line-height:1.6; }
   .na { background:var(--card); border:1px solid var(--line); border-radius:14px;
     padding:30px; color:var(--muted); }
-
   /* first-run onboarding */
   .welcome { background:var(--card); border:1px solid var(--line); border-radius:16px;
     padding:26px 28px; max-width:640px; }
@@ -203,7 +210,6 @@ PAGE = r"""<!doctype html>
   .w-btn:hover { filter:brightness(1.05); }
   .w-muted { color:var(--muted); font-size:12.5px; }
   .w-poll-dot { width:8px; height:8px; border-radius:50%; background:var(--line); }
-  .w-poll-dot.on { background:var(--accent); box-shadow:0 0 0 3px var(--accent-bg); }
 </style>
 </head>
 <body>
@@ -220,19 +226,20 @@ PAGE = r"""<!doctype html>
 var MODEL = __DATA__;
 
 // Model burn factors, derived from Anthropic's published API pricing (per MTok
-// in/out): Fable 5 $10/$50, Opus 5 & Opus 4.8 $5/$25, Sonnet 5 $3/$15. The input
-// and output ratios agree exactly, so the factor is unambiguous: Fable = 2.0x
-// Opus, Sonnet = 0.6x. Baseline 1.0 is Opus - the tier most measured burn
-// history is recorded on.
+// in/out): Fable 5 $10/$50, Opus 5 & Opus 4.8 $5/$25, Sonnet 5 $3/$15 (intro
+// $2/$10 through 2026-08-31). The input and output ratios agree exactly, so the
+// factor is unambiguous: Fable = 2.0x Opus, Sonnet = 0.6x Opus. Baseline 1.0 is
+// Opus — the model this machine's measured burn history ran on.
 var MODELS = [
   { name: "Fable", mult: 2.0 },
   { name: "Opus", mult: 1.0 },
   { name: "Sonnet", mult: 0.6 }
 ];
-// Effort stops modulate token *volume*, not per-token price - Anthropic
+// Effort stops modulate token *volume*, not per-token price — Anthropic
 // publishes no cost figures for them, so these are estimates relative to Extra
-// (xhigh), Claude Code's default. Ultracode is multi-agent orchestration on top
-// of max effort (~2.5x).
+// (xhigh), Claude Code's default and this tool's measured baseline. Ultracode is
+// multi-agent orchestration on top of max effort (~2.5x, the tool's original
+// calibration).
 var EFFORTS = [
   { name: "Low", mult: 0.4 },
   { name: "Medium", mult: 0.6 },
@@ -259,9 +266,10 @@ function fmtWhen(ms) {
 function classFor(v) { return v === "over" ? "over" : (v === "tight" ? "tight" : "clear"); }
 
 // Client-side projection so the sliders recompute instantly. Mirrors _project()
-// in usage.py: given current %, burn rate (pts/h) and hours until reset, does it
-// hit 100 before the window resets?
-function project(pct, ratePerH, hoursToReset) {
+// in usage.py. `bandPts` is the calibrated +/- uncertainty (from the server's
+// backtest of this user's own history); when given, the verdict judges the
+// RANGE, not the point: over only when even the optimistic edge busts.
+function project(pct, ratePerH, hoursToReset, bandPts) {
   var remaining = Math.max(0, 100 - pct);
   var hoursToFull = ratePerH <= 0.0001 ? null : remaining / ratePerH;
   var pctAtReset = (hoursToReset == null) ? null :
@@ -269,10 +277,16 @@ function project(pct, ratePerH, hoursToReset) {
   var verdict;
   if (hoursToReset == null) verdict = "unknown";
   else if (hoursToFull === null) verdict = "clear";
+  else if (bandPts != null && pctAtReset != null) {
+    if (pctAtReset - bandPts >= 100) verdict = "over";
+    else if (pctAtReset + bandPts >= 100) verdict = "tight";
+    else verdict = "clear";
+  }
   else if (hoursToFull >= hoursToReset * 1.15) verdict = "clear";
   else if (hoursToFull >= hoursToReset) verdict = "tight";
   else verdict = "over";
-  return { hoursToFull: hoursToFull, pctAtReset: pctAtReset, verdict: verdict };
+  return { hoursToFull: hoursToFull, pctAtReset: pctAtReset, verdict: verdict,
+           bandPts: bandPts == null ? null : bandPts };
 }
 
 function barHTML(pct, projPct, cls) {
@@ -288,10 +302,19 @@ function barHTML(pct, projPct, cls) {
 function panelHTML(title, meta, state) {
   var cls = classFor(state.verdict);
   var projShow = state.pctAtReset == null ? null : Math.round(state.pctAtReset);
-  var projLabel = projShow == null ? "—" :
-      (projShow > 100 ? ("~" + projShow + "% — over by " + (projShow - 100)) : ("~" + projShow + "%"));
+  var band = state.bandPts == null ? null : Math.round(state.bandPts);
+  var projLabel;
+  if (projShow == null) projLabel = "—";
+  else if (band != null) {
+    // The honest read: a calibrated range, not one fake-precise number.
+    var lo = Math.max(0, projShow - band), hi = projShow + band;
+    projLabel = lo + "–" + Math.min(hi, 200) + "%" +
+        (projShow > 100 ? " (mid " + projShow + ")" : "");
+  }
+  else projLabel = projShow > 100 ? ("~" + projShow + "% — over by " + (projShow - 100)) : ("~" + projShow + "%");
   var rows = '';
-  rows += metaRow("Burn rate now", meta.rate.toFixed(meta.rateDp) + " pts/hr");
+  rows += metaRow(meta.rateLabel || "Burn rate now", meta.rate.toFixed(meta.rateDp) + " pts/hr");
+  if (meta.rate2 != null) rows += metaRow("Burst rate (last ~2h)", meta.rate2.toFixed(2) + " pts/hr");
   if (meta.resetLabel) rows += metaRow("Window resets", meta.resetLabel);
   rows += metaRow("Time to reset", fmtHours(meta.hoursToReset));
   rows += metaRow("Hits 100% in", fmtHours(state.hoursToFull),
@@ -404,7 +427,7 @@ function renderOnboarding(app) {
           "Otherwise grab it from <a href=\"https://claude.com/claude-code\" target=\"_blank\" rel=\"noopener\">claude.com/claude-code</a>.") +
         stepHTML(step2state, "Let it record your usage once",
           "In any Claude Code session, run <code>/usage</code>. That makes Claude Code " +
-          "start sampling your 5-hour and 7-day limits (about every 5 minutes) to a " +
+          "start sampling your 5-hour and 7-day limits (about every 15 minutes) to a " +
           "local file. You only need to do this once; it keeps updating after.") +
         stepHTML("wait", "This page picks it up automatically",
           "<span id=\"poll-msg\">Watching for your usage file&hellip;</span> " +
@@ -442,7 +465,7 @@ function stepHTML(state, title, body) {
 var _pollTimer = null, _polling = false;
 function startPolling() {
   if (_pollTimer) return;
-  _pollTimer = setInterval(pollNow, 8000);   // gentle - the file updates ~5 min
+  _pollTimer = setInterval(pollNow, 8000);   // gentle - the file updates ~15 min
 }
 function pollNow() {
   if (_polling) return;
@@ -485,47 +508,66 @@ function render() {
   var modelName = localStorage.getItem("usage.model") || "Opus";
   var model = MODELS.filter(function (m) { return m.name === modelName; })[0] || MODELS[1];
   var effort = EFFORTS[effortIdx];
-  var ultra = model.mult * effort.mult;   // effective burn = model x effort
+  var mult = model.mult * effort.mult;
   try {
     localStorage.setItem("usage.activeHours", activeHours);
     localStorage.setItem("usage.effort", effortIdx);
     localStorage.setItem("usage.model", model.name);
-  } catch (e) { /* private mode / storage off - just don't persist */ }
+  } catch (e) { /* private mode / storage off — just don't persist */ }
 
-  // Effective weekly burn: the measured pts/hr, scaled by how much of each day
-  // you're actually in sessions, times the Ultracode multiplier. The measured
-  // rate is "while active", so daily contribution = rate * activeHours, spread
-  // across 24h -> effective pts/hr = rate * activeHours/24 * ultra.
-  var sevenRateEff = seven.rate_per_h * (activeHours / 24) * ultra;
-  var sevenState = project(seven.pct, sevenRateEff, seven.hours_to_reset);
-  // 5-hour window: the current burst, scaled only by Ultracode (it's a live
-  // burst, active-hours doesn't dilute a window this short).
-  var fiveRateEff = five.rate_per_h * ultra;
-  var fiveState = project(five.pct, fiveRateEff, five.window_h);
+  // Weekly base: week-to-date pace (backtested unbiased; the old 2h-slope
+  // extrapolation ran ~9pts hot). The burst slope stays visible as a secondary
+  // row. The active-hours slider scales relative to your MEASURED rhythm:
+  // implied active h/day = (wtd / burst) * 24 - i.e. what mix of work and idle
+  // actually produced this week's pace - so the slider's default position IS
+  // your real behavior, and moving it models doing more or less than that.
+  var wtdRate = seven.wtd_rate_per_h != null ? seven.wtd_rate_per_h : seven.rate_per_h;
+  var burst = seven.rate_per_h || 0;
+  var impliedActive = (burst > 0.01 && wtdRate > 0)
+      ? Math.min(16, Math.max(0.5, wtdRate / burst * 24)) : 6;
+  if (!aEl && !isFinite(sActive)) activeHours = Math.round(impliedActive * 2) / 2;
+  var sevenRateEff = wtdRate * (activeHours / impliedActive) * mult;
+  var sevenState = project(seven.pct, sevenRateEff, seven.hours_to_reset, seven.band_pts);
+  // 5-hour window: the current burst, scaled only by model x effort (it's a
+  // live burst), over the REAL remaining horizon - the server estimates when
+  // this window opened, so we no longer project a fresh 5 hours every render.
+  var fiveRateEff = five.rate_per_h * mult;
+  var fiveHorizon = five.horizon_h != null ? five.horizon_h : five.window_h;
+  var fiveState = project(five.pct, fiveRateEff, fiveHorizon);
 
   var worst = worstOf(fiveState.verdict, sevenState.verdict);
 
+  var fiveReset = five.resets_by_ms
+      ? ("by ~" + fmtWhen(five.resets_by_ms))
+      : "≤5h (window start unknown)";
   var fivePanel = panelHTML("5-hour session window", {
     pct: five.pct, rate: fiveRateEff, rateDp: 1,
-    hoursToReset: five.window_h, resetLabel: "rolling · every 5h"
+    hoursToReset: fiveHorizon, resetLabel: fiveReset
   }, fiveState);
   var sevenPanel = panelHTML("7-day weekly window", {
     pct: seven.pct, rate: sevenRateEff, rateDp: 2,
+    rateLabel: "Week-to-date pace", rate2: burst * mult,
     hoursToReset: seven.hours_to_reset, resetLabel: fmtWhen(seven.next_reset_ms)
   }, sevenState);
 
-  // Ultracode read-out: what does flipping it on do to the weekly window?
-  var ultraOn = project(seven.pct, seven.rate_per_h * (activeHours / 24) * model.mult * 2.5,
-                        seven.hours_to_reset);
+  // Ultracode read-out: what does the top effort stop (~2.5x fan-out) do to the
+  // weekly window on the currently selected model? Same WTD base and band as
+  // the main projection, and the real reset day - not a hardcoded "Tuesday"
+  // (this account's reset has already moved once).
+  var resetDay = seven.next_reset_ms
+      ? ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][new Date(seven.next_reset_ms).getDay()]
+      : "the reset";
+  var ultraOn = project(seven.pct, wtdRate * (activeHours / impliedActive) * model.mult * 2.5,
+                        seven.hours_to_reset, seven.band_pts);
   var ultraMsg;
   if (seven.pct >= 99) {
-    ultraMsg = 'You&rsquo;re at the weekly cap now — Ultracode has nothing left to spend until Tuesday.';
+    ultraMsg = 'You&rsquo;re at the weekly cap now — Ultracode has nothing left to spend until ' + resetDay + '.';
   } else if (ultraOn.verdict === "over") {
     var by = ultraOn.pctAtReset ? Math.round(ultraOn.pctAtReset - 100) : null;
     ultraMsg = 'At ~2.5× burn, Ultracode would <b>blow past the weekly limit</b>' +
-      (by && by > 0 ? ' by ~' + by + '%' : '') + ' before Tuesday. Save it for a lighter week.';
+      (by && by > 0 ? ' by ~' + by + '%' : '') + ' before ' + resetDay + '. Save it for a lighter week.';
   } else if (ultraOn.verdict === "tight") {
-    ultraMsg = 'Ultracode (~2.5× burn) would land you <b>right at the weekly limit</b>. Doable for a focused push, but no cushion.';
+    ultraMsg = 'Ultracode (~2.5× burn) <b>could land you at the weekly limit</b> before ' + resetDay + ' — inside the uncertainty band. Doable for a focused push, but no cushion.';
   } else {
     ultraMsg = 'Your weekly budget can <b>absorb Ultracode</b> (~2.5× burn) and still reset with room to spare. Green light.';
   }
@@ -540,7 +582,20 @@ function render() {
     return '<button type="button" class="preset' + on + '" data-model="' + m.name + '">' + m.name + '</button>';
   }).join("");
 
+  // Staleness: sampling stops whenever Claude Code isn't running, and stale
+  // percentages presented as "now" were a real inaccuracy. Chip when fresh,
+  // banner when old.
+  var ageMin = MODEL.data_age_min != null ? MODEL.data_age_min : 0;
+  var staleHtml = "";
+  if (ageMin > 30) {
+    var ageTxt = ageMin >= 90 ? (Math.round(ageMin / 6) / 10 + " h") : (Math.round(ageMin) + " min");
+    staleHtml = '<div class="stale-banner">Data is <b>' + ageTxt + ' old</b> — Claude Code ' +
+      'hasn&rsquo;t sampled since ' + fmtWhen(MODEL.latest_sample_ms) +
+      '. Percentages are as of then; time-to-reset is current.</div>';
+  }
+
   app.innerHTML =
+    staleHtml +
     verdictBand(worst, fiveState, sevenState) +
     '<div class="cols">' + fivePanel + sevenPanel + '</div>' +
     '<div class="chartcard"><h2>Last 72 hours</h2>' +
@@ -562,7 +617,7 @@ function render() {
       '<div class="ctl"><label>Effort<small>Low · Medium · High · Extra · Max · Ultracode</small></label>' +
         '<input type="range" id="f-effort" min="0" max="' + (EFFORTS.length - 1) + '" step="1" value="' + effortIdx + '">' +
         '<output>' + effort.name + '</output></div>' +
-      '<div class="presets"><span class="plabel">Effective burn</span><b>' + ultra.toFixed(1) + '×</b>' +
+      '<div class="presets"><span class="plabel">Effective burn</span><b>' + mult.toFixed(1) + '×</b>' +
         '<span class="plabel" style="text-transform:none;letter-spacing:0">= ' + model.name + ' ' +
         model.mult.toFixed(1) + ' × ' + effort.name + ' ' + effort.mult.toFixed(1) + '</span></div>' +
       '<div class="ultra"><div class="u-ic">U</div><div class="u-body">' +
@@ -590,11 +645,12 @@ render();
 
 var foot = document.getElementById("foot");
 if (MODEL && MODEL.available) {
-  var d = new Date(MODEL.now_ms);
+  var d = new Date(MODEL.latest_sample_ms || MODEL.now_ms);
   foot.innerHTML = 'Reading <code>~/Library/Application Support/Claude/plan-usage-history.json</code> — ' +
-    MODEL.sample_count + ' samples, latest ' + d.toLocaleString() + '. ' +
-    'Percentages are the same ones <code>/usage</code> shows; burn rate is measured from the recent slope. ' +
-    'Read-only — nothing here changes your usage.';
+    MODEL.sample_count + ' samples (~5 min apart), latest ' + d.toLocaleString() + '. ' +
+    'Percentages are the same ones <code>/usage</code> shows. The weekly projection is your ' +
+    'week-to-date pace; the range around it is the median error of that projector, backtested ' +
+    'against your own completed weeks. Read-only — nothing here changes your usage.';
 }
 </script>
 </body>

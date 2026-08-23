@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code usage modeler - read local /usage history and project it forward.
 
-The dashboard's other panels are about the apps; this one is about the tool
-that builds them. Claude Code samples the `/usage` limit bars every ~5 minutes
+Claude Code samples the `/usage` limit bars every ~5 minutes
 and persists them to
 
     ~/Library/Application Support/Claude/plan-usage-history.json
@@ -158,26 +157,19 @@ def _weekly_resets(samples):
 
 
 def _weekly_anchor(resets):
-    """Infer the recurring weekly reset (weekday, hour, minute) from history.
+    """Anchor the weekly cadence to the *most recent* observed reset.
 
-    Returns a dict describing the most common reset weekday/time, or None if
-    there isn't enough signal. We take the *most recent* resets as the truth
-    (the anchor can shift if the plan changed) and pick the dominant weekday.
+    An earlier version voted for the dominant weekday across recent resets.
+    That backfired in practice: when Anthropic moved this account's reset from
+    Tue ~22:00 to Wed ~09:18 (observed 2026-08-19), the vote kept projecting
+    Tuesdays - ~35h off. The newest reset is simply the truth; history adds
+    nothing once the anchor moves.
     """
     if not resets:
         return None
-    recent = resets[-6:]
-    dows = {}
-    for ms in recent:
-        dt = datetime.datetime.fromtimestamp(ms / 1000)
-        dows.setdefault(dt.weekday(), []).append(dt)
-    # Dominant weekday, tie-broken by most recent.
-    best_dow = max(dows, key=lambda d: (len(dows[d]), max(x.timestamp() for x in dows[d])))
-    times = dows[best_dow]
-    # Median-ish time on that weekday: use the latest one's clock time.
-    ref = max(times, key=lambda x: x.timestamp())
-    return {"weekday": best_dow, "hour": ref.hour, "minute": ref.minute,
-            "last_reset_ms": int(ref.timestamp() * 1000)}
+    ref = datetime.datetime.fromtimestamp(resets[-1] / 1000)
+    return {"weekday": ref.weekday(), "hour": ref.hour, "minute": ref.minute,
+            "last_reset_ms": resets[-1]}
 
 
 def _next_weekly_reset(anchor, now_dt):
@@ -195,6 +187,94 @@ def _next_weekly_reset(anchor, now_dt):
     while candidate <= now_dt:
         candidate += week
     return candidate
+
+
+def _wtd_rate(samples, resets, now_ms):
+    """Week-to-date pace: pts/hour averaged since the last weekly reset.
+
+    Backtesting this history showed the 2h-slope projector runs ~+9pts hot
+    (it extrapolates the current burst around the clock), while WTD pace is
+    unbiased - it already contains the real mix of work, idle and sleep. It is
+    the central projector; the burst slope stays as the "if you keep this up"
+    secondary read.
+    """
+    if not resets:
+        return None
+    since = [s for s in samples if s["t"] >= resets[-1]]
+    if not since:
+        return None
+    elapsed_h = (now_ms - resets[-1]) / 3600_000
+    if elapsed_h < 6:
+        return None                      # too early in the window to average
+    return since[-1]["sd"] / elapsed_h
+
+
+def _calibrate_band(samples, resets):
+    """Projection uncertainty, learned from this user's own completed windows.
+
+    For every checkpoint inside each completed weekly window, compute the
+    week-to-date projection error vs the window's actual final value; return
+    the median absolute error bucketed by hours-remaining. The UI shows the
+    projection as a range (central +/- band) instead of one fake-precise
+    number - on this history the honest band is ~20-48pts, shrinking as the
+    reset nears.
+    """
+    buckets = {"96": [], "48": [], "24": [], "0": []}
+    for w in range(len(resets) - 1):
+        a, b = resets[w], resets[w + 1]
+        window = [s for s in samples if a <= s["t"] < b]
+        if not window:
+            continue
+        end_pct = window[-1]["sd"]
+        for s_ in window[::3]:            # thin 3x; precision isn't needed here
+            elapsed = (s_["t"] - a) / 3600_000
+            rem = (b - s_["t"]) / 3600_000
+            if elapsed < 12 or rem < 1:
+                continue
+            err = abs(s_["sd"] + s_["sd"] / elapsed * rem - end_pct)
+            key = "96" if rem >= 96 else "48" if rem >= 48 else \
+                  "24" if rem >= 24 else "0"
+            buckets[key].append(err)
+    out = {}
+    for key, errs in buckets.items():
+        if errs:
+            errs.sort()
+            out[key] = round(errs[len(errs) // 2], 1)
+    return out or None
+
+
+def _band_for(band, hours_to_reset):
+    """The +/- band that applies right now, given hours until the reset."""
+    if not band or hours_to_reset is None:
+        return None
+    key = "96" if hours_to_reset >= 96 else "48" if hours_to_reset >= 48 else \
+          "24" if hours_to_reset >= 24 else "0"
+    # Fall back to the nearest populated bucket.
+    for k in (key, "24", "48", "96", "0"):
+        if k in band:
+            return band[k]
+    return None
+
+
+def _fh_window_start(samples, now_ms):
+    """Approximate start of the live 5-hour window, or None if unknowable.
+
+    The fh series steps: it climbs while a session block is active and drops
+    when the block's window expires. The window opened at the last idle->climb
+    transition (or right after the last drop). Sampling is ~5min so this is
+    approximate - callers should present it as "~" - but it beats the old
+    behavior of always projecting a full fresh 5 hours.
+    """
+    horizon = [s for s in samples if now_ms - s["t"] <= FIVE_HOUR * 3600_000]
+    if len(horizon) < 2 or horizon[-1]["fh"] <= 2:
+        return None                      # idle now, or nothing to see
+    start = None
+    for prev, cur in zip(horizon, horizon[1:]):
+        if prev["fh"] - cur["fh"] >= RESET_DROP:
+            start = cur["t"]             # window re-opened at the drop
+        elif prev["fh"] <= 2 < cur["fh"]:
+            start = prev["t"]            # climbed out of idle
+    return start
 
 
 def _project(pct, rate_per_h, hours_to_reset):
@@ -258,24 +338,61 @@ def load_usage(path=None, now_ms=None):
         }
 
     latest = samples[-1]
-    now_ms = now_ms or latest["t"]
+    # Wall-clock "now", not the newest sample: sampling stops when Claude Code
+    # isn't running (this history has 40+ gaps over an hour), and presenting
+    # day-old percentages as current was one of the tool's real inaccuracies.
+    # The staleness is measured and surfaced instead of hidden. `now_ms` can
+    # still be pinned for tests.
+    if now_ms is None:
+        now_ms = int(datetime.datetime.now().timestamp() * 1000)
+        now_ms = max(now_ms, latest["t"])     # tolerate clock skew in the file
     now_dt = datetime.datetime.fromtimestamp(now_ms / 1000)
+    data_age_min = (now_ms - latest["t"]) / 60_000
 
-    fh_rate = _burn_rate(samples, "fh", now_ms)
-    sd_rate = _burn_rate(samples, "sd", now_ms)
+    # Burn rates are measured at the newest sample (measuring at a stale "now"
+    # would dilute the slope with empty time).
+    fh_rate = _burn_rate(samples, "fh", latest["t"])
+    sd_rate = _burn_rate(samples, "sd", latest["t"])
 
-    # 5-hour window: rolling. Time-to-reset is bounded by the window length;
-    # the practical question is whether the *current* burst tops out the bar
-    # before the window rolls off. We treat 5h as the horizon.
-    five_h = _project(latest["fh"], fh_rate, FIVE_HOUR)
+    # 5-hour window: fh steps, it doesn't roll smoothly - it climbs during a
+    # session block and drops ~5h after the block began. Estimate the live
+    # window's start so the projection horizon is the time actually left, not
+    # a fresh 5 hours every render.
+    fh_start = _fh_window_start(samples, now_ms)
+    if fh_start is not None:
+        fh_resets_by = fh_start + int(FIVE_HOUR * 3600_000)
+        fh_horizon = max(0.0, (fh_resets_by - now_ms) / 3600_000)
+    else:
+        fh_resets_by = None
+        fh_horizon = FIVE_HOUR            # unknown start: ceiling, labeled "<=5h"
+    five_h = _project(latest["fh"], fh_rate, fh_horizon)
 
-    # 7-day window: fixed weekly anchor inferred from history.
+    # 7-day window: anchored to the most recent observed reset.
     resets = _weekly_resets(samples)
     anchor = _weekly_anchor(resets)
     next_reset_dt = _next_weekly_reset(anchor, now_dt)
     hours_to_weekly = ((next_reset_dt - now_dt).total_seconds() / 3600
                        if next_reset_dt else None)
-    seven_d = _project(latest["sd"], sd_rate, hours_to_weekly)
+
+    # Central projector: week-to-date pace (unbiased on backtest), with an
+    # uncertainty band calibrated from this user's own completed windows.
+    # The burst slope (sd_rate) stays available as "if you keep this up".
+    wtd = _wtd_rate(samples, resets, now_ms)
+    band_all = _calibrate_band(samples, resets)
+    band = _band_for(band_all, hours_to_weekly)
+    central_rate = wtd if wtd is not None else sd_rate
+    seven_d = _project(latest["sd"], central_rate, hours_to_weekly)
+    # Verdict honesty: judge the range, not the point. Over only when even the
+    # optimistic edge busts; tight when the band straddles 100.
+    if seven_d["pct_at_reset"] is not None and band is not None:
+        low = seven_d["pct_at_reset"] - band
+        high = seven_d["pct_at_reset"] + band
+        if low >= 100:
+            seven_d["verdict"] = "over"
+        elif high >= 100:
+            seven_d["verdict"] = "tight"
+        else:
+            seven_d["verdict"] = "clear"
 
     # Compact history for the sparkline/chart: last ~72h, thinned to <= 240 pts.
     horizon = now_ms - 72 * 3600_000
@@ -292,15 +409,25 @@ def load_usage(path=None, now_ms=None):
         "available": True,
         "path": path,
         "now_ms": now_ms,
+        "latest_sample_ms": latest["t"],
+        "data_age_min": round(data_age_min, 1),
         "org": latest.get("org"),
         "sample_count": len(samples),
         "history_from_ms": samples[0]["t"],
         "five_hour": {
             "pct": latest["fh"], "rate_per_h": round(fh_rate, 2),
-            "window_h": FIVE_HOUR, **five_h,
+            "window_h": FIVE_HOUR,
+            "window_start_ms": fh_start,
+            "resets_by_ms": fh_resets_by,
+            "horizon_h": round(fh_horizon, 2),
+            **five_h,
         },
         "seven_day": {
-            "pct": latest["sd"], "rate_per_h": round(sd_rate, 3),
+            "pct": latest["sd"],
+            "rate_per_h": round(sd_rate, 3),          # burst: "if you keep this up"
+            "wtd_rate_per_h": round(wtd, 3) if wtd is not None else None,
+            "band_pts": band,                          # +/- on pct_at_reset
+            "band_by_bucket": band_all,
             "next_reset_ms": int(next_reset_dt.timestamp() * 1000) if next_reset_dt else None,
             "hours_to_reset": round(hours_to_weekly, 2) if hours_to_weekly is not None else None,
             "anchor": anchor, "prev_window_peak": prev_peak, **seven_d,

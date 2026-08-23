@@ -91,13 +91,22 @@ paths were checked.
 
 ## How the projection works (so you can trust the numbers)
 
-- **Burn rate** is the slope of your usage over the recent samples (a reset
-  inside that window is detected and only the fresh tail is measured).
-- **The weekly reset** is inferred from your own history — the tool finds where
-  your 7‑day usage has dropped to zero before and rolls that cadence forward.
-  It's *your* reset day/time, not a hardcoded one.
-- **The verdict** compares "hours until this window hits 100%" against "hours
-  until it resets."
+- **The weekly projection** is your *week‑to‑date pace* (usage so far ÷ hours
+  since your last reset), which already contains your real mix of work, idle
+  and sleep. Backtesting shows extrapolating the current burst runs hot; the
+  burst rate is still shown as a secondary "if you keep this up" line.
+- **The range, not a point.** The tool backtests its own projector against your
+  completed weeks and shows the projection as a range (median error by
+  time‑remaining — typically wide early in the week, tight near the reset).
+  The verdict judges the range: "over" only when even the optimistic edge busts.
+- **The weekly reset** is anchored to your *most recent* observed reset and
+  rolled forward in 7‑day steps — so if your account's reset day ever moves,
+  the tool follows it on the next reset.
+- **The 5‑hour window** estimates when your current session window actually
+  opened (it steps, it doesn't roll smoothly), so "time to reset" is the time
+  you really have left — approximate, and labeled as such.
+- **Staleness is surfaced.** Sampling stops when Claude Code isn't running;
+  if the newest sample is old you get a banner, not silently stale numbers.
 
 The math lives in `usage.py`; `test_usage.py` covers the edge cases (resets,
 short histories, boundaries). Run the tests with:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Edge-case tests for the usage modeler math. Run: python3 test_usage.py
 
-No framework - just asserts, so it runs anywhere Python runs.
+No framework - just asserts, so it runs anywhere the dashboard runs.
 """
 import datetime
 
@@ -101,6 +101,63 @@ def test_empty_and_missing():
 
 def test_single_sample_no_crash():
     assert U._burn_rate([_s(0, 5, 5)], "fh", 0) == 0.0
+
+
+def test_anchor_follows_moved_reset():
+    # Three Tuesday resets, then the account's reset moves to a Wednesday
+    # morning (this really happened). The anchor must follow the newest reset,
+    # not vote for the historically dominant weekday.
+    tue = datetime.datetime(2026, 8, 11, 22, 10)
+    wed = datetime.datetime(2026, 8, 19, 9, 18)
+    resets = [int((tue - datetime.timedelta(days=14)).timestamp() * 1000),
+              int((tue - datetime.timedelta(days=7)).timestamp() * 1000),
+              int(tue.timestamp() * 1000),
+              int(wed.timestamp() * 1000)]
+    anchor = U._weekly_anchor(resets)
+    assert anchor["weekday"] == wed.weekday(), anchor
+    nxt = U._next_weekly_reset(anchor, datetime.datetime(2026, 8, 23, 12, 0))
+    assert nxt == wed + datetime.timedelta(days=7), nxt
+
+
+def test_wtd_rate_averages_since_reset():
+    # Reset at t=0h, now t=50h at 25% -> 0.5 pts/h regardless of bursts.
+    samples = [_s(0, 0, 0), _s(10, 0, 20), _s(50, 0, 25)]
+    r = U._wtd_rate(samples, [0], 50 * H)
+    assert abs(r - 0.5) < 1e-6, r
+
+
+def test_wtd_rate_too_early_is_none():
+    samples = [_s(0, 0, 0), _s(2, 0, 10)]
+    assert U._wtd_rate(samples, [0], 2 * H) is None
+
+
+def test_band_for_picks_bucket():
+    band = {"96": 48.0, "48": 37.0, "24": 30.0, "0": 20.0}
+    assert U._band_for(band, 100) == 48.0
+    assert U._band_for(band, 60) == 37.0
+    assert U._band_for(band, 30) == 30.0
+    assert U._band_for(band, 5) == 20.0
+    assert U._band_for(band, None) is None
+    assert U._band_for(None, 5) is None
+
+
+def test_fh_window_start_from_idle_climb():
+    # Idle (fh<=2) until t=1h, climbs from t=1h -> window started ~1h.
+    samples = [_s(0, 1, 5), _s(1, 1, 5), _s(2, 20, 5), _s(3, 40, 5)]
+    start = U._fh_window_start(samples, 3 * H)
+    assert start == 1 * H, start
+
+
+def test_fh_window_start_after_drop():
+    # Drop at t=2h (60 -> 4) then climbing: window re-opened at the drop.
+    samples = [_s(0, 40, 5), _s(1, 60, 5), _s(2, 4, 5), _s(3, 15, 5)]
+    start = U._fh_window_start(samples, 3 * H)
+    assert start == 2 * H, start
+
+
+def test_fh_window_start_unknown_when_idle():
+    samples = [_s(0, 30, 5), _s(1, 1, 5), _s(2, 1, 5)]
+    assert U._fh_window_start(samples, 2 * H) is None
 
 
 def run():
