@@ -65,23 +65,6 @@ def test_project_tight_band():
     assert p["verdict"] == "tight", p
 
 
-def test_previous_window_peak_needs_two_resets():
-    samples = [_s(0, 0, 10), _s(1, 0, 40)]
-    assert U._previous_window_peak(samples, []) is None
-    assert U._previous_window_peak(samples, [1 * H]) is None  # only one reset
-
-
-def test_previous_window_peak_inclusive_lower_bound():
-    # window between reset@1h and reset@3h; peak inside should be found,
-    # including the sample exactly at the lower reset boundary.
-    samples = [_s(0, 0, 90),   # before prev window
-               _s(1, 0, 20),   # == prev_reset (inclusive)
-               _s(2, 0, 55),   # peak of the completed window
-               _s(3, 0, 5)]    # == last_reset (exclusive)
-    peak = U._previous_window_peak(samples, [1 * H, 3 * H])
-    assert peak == 55.0, peak
-
-
 def test_next_weekly_reset_rolls_forward_whole_weeks():
     anchor = {"weekday": 1, "hour": 22, "minute": 10,
               "last_reset_ms": int(datetime.datetime(2026, 8, 11, 22, 10).timestamp() * 1000)}
@@ -119,40 +102,6 @@ def test_anchor_follows_moved_reset():
     assert nxt == wed + datetime.timedelta(days=7), nxt
 
 
-def test_wtd_rate_averages_since_reset():
-    # Reset at t=0h, now t=50h at 25% -> 0.5 pts/h regardless of bursts.
-    samples = [_s(0, 0, 0), _s(10, 0, 20), _s(50, 0, 25)]
-    r = U._wtd_rate(samples, [0], 50 * H)
-    assert abs(r - 0.5) < 1e-6, r
-
-
-def test_wtd_rate_too_early_is_none():
-    samples = [_s(0, 0, 0), _s(2, 0, 10)]
-    assert U._wtd_rate(samples, [0], 2 * H) is None
-
-
-def test_band_for_picks_bucket():
-    band = {"96": {"lo": -43.0, "hi": 61.0}, "48": {"lo": -39.0, "hi": 24.0},
-            "24": {"lo": -40.0, "hi": 17.0}, "0": {"lo": -23.0, "hi": -7.0}}
-    assert U._band_for(band, 100)["hi"] == 61.0
-    assert U._band_for(band, 60)["lo"] == -39.0
-    assert U._band_for(band, 30)["hi"] == 17.0
-    assert U._band_for(band, 5)["lo"] == -23.0
-    assert U._band_for(band, None) is None
-    assert U._band_for(None, 5) is None
-
-
-def test_max_gain_over_ignores_reset_drops():
-    # 0->40 climb, reset to 0, 0->30 climb. Max gain over a long stretch must
-    # be 40 (within one window), never 70 (across the reset).
-    samples = [_s(0, 0, 0), _s(10, 0, 40), _s(11, 0, 2), _s(20, 0, 30)]
-    g = U._max_gain_over(samples, [11 * H], 100)
-    assert g == 40.0, g
-    # short stretch: only what fits in the duration
-    g2 = U._max_gain_over(samples, [11 * H], 9)
-    assert g2 <= 40.0 and g2 >= 28.0, g2
-
-
 def test_fh_window_start_from_idle_climb():
     # Idle (fh<=2) until t=1h, climbs from t=1h -> window started ~1h.
     samples = [_s(0, 1, 5), _s(1, 1, 5), _s(2, 20, 5), _s(3, 40, 5)]
@@ -170,6 +119,24 @@ def test_fh_window_start_after_drop():
 def test_fh_window_start_unknown_when_idle():
     samples = [_s(0, 30, 5), _s(1, 1, 5), _s(2, 1, 5)]
     assert U._fh_window_start(samples, 2 * H) is None
+
+
+def test_active_rate_uses_current_week_only():
+    # Reset at t=100h. Before it: heavy usage that must be ignored entirely.
+    # After: 4 active samples (fh>2) 30min apart gaining 3 sd points over 1.5h.
+    samples = [_s(0, 90, 10), _s(50, 90, 80),            # previous week - ignored
+               _s(100, 5, 0),                             # reset
+               _s(100.5, 20, 1), _s(101, 30, 2), _s(101.5, 40, 3)]
+    a = U._active_rate(samples, [int(100 * H)], int(101.5 * H))
+    assert a is not None, a
+    assert abs(a["active_hours"] - 1.5) < 1e-6, a
+    assert abs(a["rate_per_h"] - 2.0) < 0.01, a   # 3 pts / 1.5h
+
+
+def test_active_rate_skips_idle_and_gaps():
+    # fh<=2 the whole time = idle; no active hours to measure.
+    samples = [_s(0, 0, 0), _s(1, 1, 0), _s(2, 2, 0), _s(3, 1, 0)]
+    assert U._active_rate(samples, [0], int(3 * H)) is None
 
 
 def run():

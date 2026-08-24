@@ -189,121 +189,29 @@ def _next_weekly_reset(anchor, now_dt):
     return candidate
 
 
-def _wtd_rate(samples, resets, now_ms):
-    """Week-to-date pace: pts/hour averaged since the last weekly reset.
+def _active_rate(samples, resets, now_ms):
+    """Measured pace while actually working, from the CURRENT week only.
 
-    Backtesting this history showed the 2h-slope projector runs ~+9pts hot
-    (it extrapolates the current burst around the clock), while WTD pace is
-    unbiased - it already contains the real mix of work, idle and sleep. It is
-    the central projector; the burst slope stays as the "if you keep this up"
-    secondary read.
+    By request, past weeks feed nothing: each week is unique, so the tool
+    ships neutral facts about this one - sd points gained per hour of active
+    time (active = the 5h window shows live usage, fh > 2) - and the page's
+    sliders turn that into a plan. Sampling gaps over 30 min read as idle.
     """
-    if not resets:
-        return None
-    since = [s for s in samples if s["t"] >= resets[-1]]
-    if not since:
-        return None
-    elapsed_h = (now_ms - resets[-1]) / 3600_000
-    if elapsed_h < 6:
-        return None                      # too early in the window to average
-    return since[-1]["sd"] / elapsed_h
-
-
-def _calibrate_band(samples, resets):
-    """Projection uncertainty, learned from this user's own completed windows.
-
-    For every checkpoint inside each completed weekly window, compute the
-    week-to-date projector's SIGNED error (projection - actual end) and keep
-    the p20/p80 quantiles, bucketed by hours-remaining. Signed quantiles beat
-    a symmetric +/- band twice over: the error is skewed (early-week the
-    projector runs hot, mid-week it runs low), so the asymmetric interval is
-    both recentered and 15-60% narrower for the same confidence.
-    """
-    buckets = {"96": [], "48": [], "24": [], "0": []}
-    for w in range(len(resets) - 1):
-        a, b = resets[w], resets[w + 1]
-        window = [s for s in samples if a <= s["t"] < b]
-        if not window:
+    start = resets[-1] if resets else now_ms - 7 * 24 * 3600_000
+    week = [s for s in samples if s["t"] >= start]
+    gain = 0.0
+    hours = 0.0
+    for a, b in zip(week, week[1:]):
+        gap_h = (b["t"] - a["t"]) / 3600_000
+        if gap_h > 0.5:
             continue
-        end_pct = window[-1]["sd"]
-        for s_ in window[::3]:            # thin 3x; precision isn't needed here
-            elapsed = (s_["t"] - a) / 3600_000
-            rem = (b - s_["t"]) / 3600_000
-            if elapsed < 12 or rem < 1:
-                continue
-            err = (s_["sd"] + s_["sd"] / elapsed * rem) - end_pct
-            key = "96" if rem >= 96 else "48" if rem >= 48 else \
-                  "24" if rem >= 24 else "0"
-            buckets[key].append(err)
-    out = {}
-    for key, errs in buckets.items():
-        if len(errs) >= 10:               # too few checkpoints = no calibration
-            errs.sort()
-            lo = errs[min(len(errs) - 1, int(len(errs) * 0.2))]
-            hi = errs[min(len(errs) - 1, int(len(errs) * 0.8))]
-            out[key] = {"lo": round(lo, 1), "hi": round(hi, 1)}
-    return out or None
-
-
-def _band_for(band, hours_to_reset):
-    """The signed-error quantiles {lo, hi} for the current hours-to-reset."""
-    if not band or hours_to_reset is None:
-        return None
-    key = "96" if hours_to_reset >= 96 else "48" if hours_to_reset >= 48 else \
-          "24" if hours_to_reset >= 24 else "0"
-    # Fall back to the nearest populated bucket.
-    for k in (key, "24", "48", "96", "0"):
-        if k in band:
-            return band[k]
-    return None
-
-
-def _max_gain_over(samples, resets, dur_h):
-    """The most this user has EVER burned (sd points) inside any stretch of
-    `dur_h` hours within a single weekly window. A physics cap on projections:
-    the high end of the range can't exceed current + this (nobody projects a
-    burn you've never once approached). Measured within windows so a reset
-    drop never fakes a gain."""
-    best = 0.0
-    if not samples:
-        return best
-    # Segment boundaries: history start, each reset, history end - the stretch
-    # before the first reset is a valid within-window run too.
-    bounds = [samples[0]["t"]] + list(resets) + [samples[-1]["t"] + 1]
-    for w in range(len(bounds) - 1):
-        a, b = bounds[w], bounds[w + 1]
-        pts = [s for s in samples if a <= s["t"] < b]
-        j = 0
-        for i in range(len(pts)):
-            while pts[i]["t"] - pts[j]["t"] > dur_h * 3600_000:
-                j += 1
-            window_min = min(p["sd"] for p in pts[j:i + 1])
-            best = max(best, pts[i]["sd"] - window_min)
-    return best
-
-
-def _final_stretch_gains(samples, resets, rem_h):
-    """How many sd points each completed week added in its FINAL `rem_h` hours.
-
-    The most legible answer to "is 66% with 2 days left actually tight?":
-    replay your own past final-stretches from today's number. A verdict that
-    can say "1 of your 3 past finishes would cap out from here" explains
-    itself; a bare pill doesn't.
-    """
-    if rem_h is None or rem_h <= 0:
-        return []
-    gains = []
-    for w in range(len(resets) - 1):
-        a, b = resets[w], resets[w + 1]
-        pts = [s for s in samples if a <= s["t"] < b]
-        if len(pts) < 10:
-            continue
-        cutoff = b - rem_h * 3600_000
-        before = [p["sd"] for p in pts if p["t"] <= cutoff]
-        if not before:
-            continue                      # window shorter than the stretch
-        gains.append(round(pts[-1]["sd"] - before[-1], 1))
-    return gains
+        if a["fh"] > 2 or b["fh"] > 2:
+            hours += gap_h
+            gain += max(0.0, b["sd"] - a["sd"])
+    if hours < 1:
+        return None                   # not enough active time to measure yet
+    return {"rate_per_h": round(gain / hours, 3),
+            "active_hours": round(hours, 1)}
 
 
 def _fh_window_start(samples, now_ms):
@@ -424,37 +332,13 @@ def load_usage(path=None, now_ms=None):
     hours_to_weekly = ((next_reset_dt - now_dt).total_seconds() / 3600
                        if next_reset_dt else None)
 
-    # Central projector: week-to-date pace (unbiased on backtest), with an
-    # uncertainty band calibrated from this user's own completed windows.
-    # The burst slope (sd_rate) stays available as "if you keep this up".
-    wtd = _wtd_rate(samples, resets, now_ms)
-    band_all = _calibrate_band(samples, resets)
-    band = _band_for(band_all, hours_to_weekly)
-    central_rate = wtd if wtd is not None else sd_rate
-    seven_d = _project(latest["sd"], central_rate, hours_to_weekly)
-    # The interval, tightened three ways beyond a naive +/- band:
-    #   1. asymmetric: actual = projection - err, so the interval is
-    #      [proj - err_hi, proj - err_lo] - recentered for the projector's
-    #      bucket-specific bias, not just widened around it.
-    #   2. floored at the current pct (usage never goes down within a window).
-    #   3. capped at current + the most ever burned in the remaining hours
-    #      (x1.1 headroom) - a projection can't exceed a burn you've never
-    #      once approached.
-    max_gain = (_max_gain_over(samples, resets, hours_to_weekly)
-                if resets and hours_to_weekly else None)
-    proj_low = proj_high = None
-    if seven_d["pct_at_reset"] is not None and band is not None:
-        proj_low = max(latest["sd"], seven_d["pct_at_reset"] - band["hi"])
-        proj_high = seven_d["pct_at_reset"] - band["lo"]
-        if max_gain is not None:
-            proj_high = min(proj_high, latest["sd"] + max_gain * 1.1)
-        proj_high = max(proj_high, proj_low + 5)   # never feign pinpoint accuracy
-        if proj_low >= 100:
-            seven_d["verdict"] = "over"
-        elif proj_high >= 100:
-            seven_d["verdict"] = "tight"
-        else:
-            seven_d["verdict"] = "clear"
+    # By request, no inference from past weeks: the projection is a PLAN.
+    # The server ships neutral current-state facts - pct, time to reset, the
+    # recent burst rate, and this week's measured pace while active - and the
+    # page's sliders (hours/day x model x effort) turn them into a projection.
+    # The server-side verdict is simply "if the current burst continues".
+    active = _active_rate(samples, resets, now_ms)
+    seven_d = _project(latest["sd"], sd_rate, hours_to_weekly)
 
     # Compact history for the sparkline/chart: last ~72h, thinned to <= 240 pts.
     horizon = now_ms - 72 * 3600_000
@@ -463,9 +347,6 @@ def load_usage(path=None, now_ms=None):
         step = len(series) // 240 + 1
         series = series[::step]
     hist = [{"t": s["t"], "fh": s["fh"], "sd": s["sd"]} for s in series]
-
-    # Did last week's 7-day window peak at the cap? (real overrun context)
-    prev_peak = _previous_window_peak(samples, resets)
 
     return {
         "available": True,
@@ -487,35 +368,13 @@ def load_usage(path=None, now_ms=None):
         "seven_day": {
             "pct": latest["sd"],
             "rate_per_h": round(sd_rate, 3),          # burst: "if you keep this up"
-            "wtd_rate_per_h": round(wtd, 3) if wtd is not None else None,
-            "band": band,                              # signed err {lo, hi}
-            "band_by_bucket": band_all,
-            "proj_low": round(proj_low, 1) if proj_low is not None else None,
-            "proj_high": round(proj_high, 1) if proj_high is not None else None,
-            "max_gain_pts": round(max_gain, 1) if max_gain is not None else None,
-            "final_stretch_gains": _final_stretch_gains(samples, resets,
-                                                        hours_to_weekly),
+            "active": active,      # this week's pace while active, or None
             "next_reset_ms": int(next_reset_dt.timestamp() * 1000) if next_reset_dt else None,
             "hours_to_reset": round(hours_to_weekly, 2) if hours_to_weekly is not None else None,
-            "anchor": anchor, "prev_window_peak": prev_peak, **seven_d,
+            "anchor": anchor, **seven_d,
         },
         "history": hist,
     }
-
-
-def _previous_window_peak(samples, resets):
-    """Peak `sd` in the most recently *completed* weekly window.
-
-    A completed window is bounded on both sides by a reset, so we need at least
-    two resets; with fewer, there's no fully-observed prior window to report.
-    The lower bound is inclusive (a reset timestamp is the first sample of the
-    new window) and the upper bound is exclusive (up to the next reset).
-    """
-    if len(resets) < 2:
-        return None
-    prev_reset, last_reset = resets[-2], resets[-1]
-    window = [s["sd"] for s in samples if prev_reset <= s["t"] < last_reset]
-    return max(window) if window else None
 
 
 def scan_token_totals(window_hours=None, now_ms=None):

@@ -269,36 +269,19 @@ function classFor(v) { return v === "over" ? "over" : (v === "tight" ? "tight" :
 // in usage.py. `bandPts` is the calibrated +/- uncertainty (from the server's
 // backtest of this user's own history); when given, the verdict judges the
 // RANGE, not the point: over only when even the optimistic edge busts.
-function project(pct, ratePerH, hoursToReset, band, maxGain, mult) {
+// Projection = a PLAN, not a forecast. Current %, hours left, and the rate
+// the sliders describe. No inference from past weeks by design.
+function project(pct, ratePerH, hoursToReset) {
   var remaining = Math.max(0, 100 - pct);
   var hoursToFull = ratePerH <= 0.0001 ? null : remaining / ratePerH;
   var pctAtReset = (hoursToReset == null) ? null :
       (ratePerH <= 0.0001 ? pct : pct + ratePerH * hoursToReset);
-  // The interval: actual = projection - err, so [proj-err_hi, proj-err_lo]
-  // (asymmetric, recentered for the projector's measured bias), floored at
-  // the current pct and capped at the most ever burned in the remaining
-  // hours - scaled by the what-if multiplier, since modeling a heavier
-  // configuration can legitimately out-burn history.
-  var low = null, high = null;
-  if (band != null && pctAtReset != null) {
-    low = Math.max(pct, pctAtReset - band.hi);
-    high = pctAtReset - band.lo;
-    if (maxGain != null) high = Math.min(high, pct + maxGain * 1.1 * (mult || 1));
-    high = Math.max(high, low + 5);
-  }
   var verdict;
   if (hoursToReset == null) verdict = "unknown";
-  else if (hoursToFull === null) verdict = "clear";
-  else if (low != null) {
-    if (low >= 100) verdict = "over";
-    else if (high >= 100) verdict = "tight";
-    else verdict = "clear";
-  }
-  else if (hoursToFull >= hoursToReset * 1.15) verdict = "clear";
-  else if (hoursToFull >= hoursToReset) verdict = "tight";
+  else if (pctAtReset == null || pctAtReset < 90) verdict = "clear";
+  else if (pctAtReset <= 100) verdict = "tight";
   else verdict = "over";
-  return { hoursToFull: hoursToFull, pctAtReset: pctAtReset, verdict: verdict,
-           low: low, high: high };
+  return { hoursToFull: hoursToFull, pctAtReset: pctAtReset, verdict: verdict };
 }
 
 function barHTML(pct, projPct, cls) {
@@ -314,14 +297,8 @@ function barHTML(pct, projPct, cls) {
 function panelHTML(title, meta, state) {
   var cls = classFor(state.verdict);
   var projShow = state.pctAtReset == null ? null : Math.round(state.pctAtReset);
-  var projLabel;
-  if (projShow == null) projLabel = "\u2014";
-  else if (state.low != null) {
-    // The honest read: a calibrated, physics-capped range.
-    projLabel = Math.round(state.low) + "\u2013" + Math.round(state.high) + "%" +
-        (projShow > 100 ? " (mid " + projShow + ")" : "");
-  }
-  else projLabel = projShow > 100 ? ("~" + projShow + "% — over by " + (projShow - 100)) : ("~" + projShow + "%");
+  var projLabel = projShow == null ? "\u2014" :
+      (projShow > 100 ? (projShow + "% \u2014 over by " + (projShow - 100)) : projShow + "%");
   var rows = '';
   rows += metaRow(meta.rateLabel || "Burn rate now", meta.rate.toFixed(meta.rateDp) + " pts/hr");
   if (meta.rate2 != null) rows += metaRow("Burst rate (last ~2h)", meta.rate2.toFixed(2) + " pts/hr");
@@ -331,7 +308,6 @@ function panelHTML(title, meta, state) {
                   state.verdict === "over" ? "warn" : "");
   rows += metaRow("Projected at reset", projLabel,
                   state.verdict === "over" ? "warn" : (state.verdict === "clear" ? "good" : ""));
-  if (meta.stretchHtml) rows += metaRow("Past finishes from here", meta.stretchHtml);
   return '<div class="panel">' +
     '<h2>' + title + '<span class="pill ' + cls + '">' + state.verdict + '</span></h2>' +
     '<div class="pct tabnum">' + Math.round(meta.pct) + '<small>%</small></div>' +
@@ -352,12 +328,12 @@ function verdictBand(worst, fiveState, sevenState) {
   var say;
   if (worst === "over") {
     say = sevenState.verdict === "over"
-      ? "At this pace the weekly limit runs out before it resets. Ease off, or you'll hit the wall like last week."
+      ? "This plan runs out of weekly budget before the reset. Cut the hours, the model, or the effort."
       : "This 5-hour burst will top out the session window before it rolls over.";
   } else if (worst === "tight") {
-    say = (window._bustNote || "You're on track to finish the window right around the limit — not much headroom.") + " Fine to keep going, but watch it.";
+    say = "This plan lands you right around the limit before the reset — no cushion. Fine, but watch it.";
   } else {
-    say = "Comfortably inside both windows. Room to push more sessions, and Ultracode is affordable from here — model it below.";
+    say = "This plan finishes inside both windows with room to spare. Push harder with the sliders to see where it tips.";
   }
   return '<div class="verdict v-' + cls + '"><div class="light" style="background:currentColor"></div>' +
     '<div class="vmain"><div class="vtag">' + tag + '</div>' +
@@ -526,59 +502,31 @@ function render() {
     localStorage.setItem("usage.model", model.name);
   } catch (e) { /* private mode / storage off — just don't persist */ }
 
-  // Weekly base: week-to-date pace (backtested unbiased; the old 2h-slope
-  // extrapolation ran ~9pts hot). The burst slope stays visible as a secondary
-  // row. The active-hours slider scales relative to your MEASURED rhythm:
-  // implied active h/day = (wtd / burst) * 24 - i.e. what mix of work and idle
-  // actually produced this week's pace - so the slider's default position IS
-  // your real behavior, and moving it models doing more or less than that.
-  var wtdRate = seven.wtd_rate_per_h != null ? seven.wtd_rate_per_h : seven.rate_per_h;
+  // The plan: your slider hours/day at the measured pace-while-active for
+  // THIS week, times model x effort. Nothing from past weeks feeds this.
+  var activeRate = (seven.active && seven.active.rate_per_h) || seven.rate_per_h || 0;
   var burst = seven.rate_per_h || 0;
-  var impliedActive = (burst > 0.01 && wtdRate > 0)
-      ? Math.min(16, Math.max(0.5, wtdRate / burst * 24)) : 6;
-  if (!aEl && !isFinite(sActive)) activeHours = Math.round(impliedActive * 2) / 2;
-  var sevenRateEff = wtdRate * (activeHours / impliedActive) * mult;
-  var sevenState = project(seven.pct, sevenRateEff, seven.hours_to_reset, seven.band, seven.max_gain_pts, mult);
-  // 5-hour window: the current burst, scaled only by model x effort (it's a
-  // live burst), over the REAL remaining horizon - the server estimates when
-  // this window opened, so we no longer project a fresh 5 hours every render.
+  var sevenRateEff = activeRate * (activeHours / 24) * mult;
+  var sevenState = project(seven.pct, sevenRateEff, seven.hours_to_reset);
+  // 5-hour window: the live burst over the real remaining horizon.
   var fiveRateEff = five.rate_per_h * mult;
   var fiveHorizon = five.horizon_h != null ? five.horizon_h : five.window_h;
   var fiveState = project(five.pct, fiveRateEff, fiveHorizon);
 
-  var worst = worstOf(fiveState.verdict, sevenState.verdict);
-
   var fiveReset = five.resets_by_ms
       ? ("by ~" + fmtWhen(five.resets_by_ms))
-      : "≤5h (window start unknown)";
+      : "\u22645h (window start unknown)";
   var fivePanel = panelHTML("5-hour session window", {
     pct: five.pct, rate: fiveRateEff, rateDp: 1,
     hoursToReset: fiveHorizon, resetLabel: fiveReset
   }, fiveState);
-  // Replay each completed week's final stretch from today's number, scaled
-  // by the what-if factor. "1 of your 3 past finishes would cap out from
-  // here" is the sentence that makes a TIGHT pill explain itself.
-  var factor = (activeHours / impliedActive) * mult;
-  var outcomes = (seven.final_stretch_gains || []).map(function (g) {
-    return Math.round(seven.pct + Math.max(0, g) * factor);
-  });
-  var busts = outcomes.filter(function (o) { return o >= 100; }).length;
-  window._bustNote = null;
-  if (busts > 0 && outcomes.length) {
-    window._bustNote = busts + " of your " + outcomes.length +
-      " past final-stretches would top out the weekly limit from here" +
-      (burst <= 0.05 ? " (nothing says you will — you're idle right now)" : "") + ".";
-  }
-  var stretchHtml = outcomes.length ? outcomes.map(function (o) {
-    return o >= 100 ? '<span class="warn" style="color:var(--warn)">' + o + '%</span>' : o + '%';
-  }).join(" / ") : null;
-
   var sevenPanel = panelHTML("7-day weekly window", {
     pct: seven.pct, rate: sevenRateEff, rateDp: 2,
-    rateLabel: "Week-to-date pace", rate2: burst * mult,
-    hoursToReset: seven.hours_to_reset, resetLabel: fmtWhen(seven.next_reset_ms),
-    stretchHtml: stretchHtml
+    rateLabel: "Planned pace", rate2: burst * mult,
+    hoursToReset: seven.hours_to_reset, resetLabel: fmtWhen(seven.next_reset_ms)
   }, sevenState);
+
+  var worst = worstOf(fiveState.verdict, sevenState.verdict);
 
   // Ultracode read-out: what does the top effort stop (~2.5x fan-out) do to the
   // weekly window on the currently selected model? Same WTD base and band as
@@ -587,8 +535,8 @@ function render() {
   var resetDay = seven.next_reset_ms
       ? ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][new Date(seven.next_reset_ms).getDay()]
       : "the reset";
-  var ultraOn = project(seven.pct, wtdRate * (activeHours / impliedActive) * model.mult * 2.5,
-                        seven.hours_to_reset, seven.band, seven.max_gain_pts, model.mult * 2.5);
+  var ultraOn = project(seven.pct, activeRate * (activeHours / 24) * model.mult * 2.5,
+                        seven.hours_to_reset);
   var ultraMsg;
   if (seven.pct >= 99) {
     ultraMsg = 'You&rsquo;re at the weekly cap now — Ultracode has nothing left to spend until ' + resetDay + '.';
@@ -602,10 +550,7 @@ function render() {
     ultraMsg = 'Your weekly budget can <b>absorb Ultracode</b> (~2.5× burn) and still reset with room to spare. Green light.';
   }
 
-  var prevPeak = seven.prev_window_peak;
-  var prevNote = (prevPeak != null && prevPeak >= 99)
-      ? ' Last week you hit 100% before the reset — the model is calibrated to that pace.'
-      : (prevPeak != null ? (' Last completed week peaked at ~' + Math.round(prevPeak) + '%.') : '');
+  var prevNote = "";
 
   var modelBtns = MODELS.map(function (m) {
     var on = m.name === model.name ? " on" : "";
