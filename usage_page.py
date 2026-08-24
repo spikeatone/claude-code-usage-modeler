@@ -78,6 +78,22 @@ PAGE = r"""<!doctype html>
     border:1px solid transparent; }
   .stale-banner b { color:var(--review); }
 
+  /* manual per-model cap entry */
+  .manual { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    font-size:13px; color:var(--muted); }
+  .manual input[type=number] { font:inherit; font-size:14px; width:76px;
+    color:var(--ink); background:var(--bg); border:1px solid var(--line);
+    border-radius:8px; padding:5px 8px; font-variant-numeric:tabular-nums; }
+  .manual input[type=number]:focus { outline:none; border-color:var(--accent); }
+  .manual .asof { font-size:12px; }
+  .manual .asof.old { color:var(--review); }
+  .manual button { font:inherit; font-size:12px; color:var(--muted);
+    background:none; border:1px solid var(--line); border-radius:7px;
+    padding:3px 10px; cursor:pointer; }
+  .manual button:hover { border-color:var(--accent); color:var(--accent); }
+  .cols3 { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+  @media (max-width:900px) { .cols3 { grid-template-columns:1fr; } }
+
   /* Verdict band */
   .verdict { border-radius:16px; padding:20px 24px; margin-bottom:24px;
     border:1px solid var(--line); display:flex; align-items:center; gap:20px;
@@ -476,6 +492,36 @@ function pollNow() {
     .catch(function () { _polling = false; if (dot) dot.classList.remove("on"); });
 }
 
+// The per-model weekly cap (e.g. "Weekly - Fable") is shown by /usage but is
+// NOT written to plan-usage-history.json, so it can't be read from disk. The
+// user types it; we stamp when, because a typed number goes stale in a way a
+// sampled one doesn't - past ~6h we stop letting it drive the verdict.
+var FABLE_KEY = "usage.fablePct", FABLE_AT = "usage.fablePctAt";
+var FABLE_STALE_H = 6;
+
+function readFable() {
+  try {
+    var v = parseFloat(localStorage.getItem(FABLE_KEY));
+    var at = parseFloat(localStorage.getItem(FABLE_AT));
+    if (!isFinite(v)) return null;
+    return { pct: Math.max(0, Math.min(100, v)),
+             at: isFinite(at) ? at : null };
+  } catch (e) { return null; }
+}
+function writeFable(pct) {
+  try {
+    if (pct == null || !isFinite(pct)) {
+      localStorage.removeItem(FABLE_KEY); localStorage.removeItem(FABLE_AT);
+    } else {
+      localStorage.setItem(FABLE_KEY, Math.max(0, Math.min(100, pct)));
+      localStorage.setItem(FABLE_AT, Date.now());
+    }
+  } catch (e) { /* storage off - just don't persist */ }
+}
+function fableAgeH(f) {
+  return (f && f.at) ? (Date.now() - f.at) / 3600000 : null;
+}
+
 function render() {
   var app = document.getElementById("app");
   if (!MODEL || !MODEL.available) { renderOnboarding(app); return; }
@@ -526,7 +572,34 @@ function render() {
     hoursToReset: seven.hours_to_reset, resetLabel: fmtWhen(seven.next_reset_ms)
   }, sevenState);
 
+  // Third gauge: the manually-entered per-model weekly cap. It shares the
+  // weekly reset clock and burns at the planned pace whenever the selected
+  // model IS that model - otherwise it just sits where it was entered.
+  var fable = readFable();
+  var fableAge = fableAgeH(fable);
+  var fableFresh = fable && (fableAge == null || fableAge <= FABLE_STALE_H);
+  var fableState = null, fablePanel = "", ageTxtOut = "";
+  if (fable) {
+    var onFable = model.name === "Fable";
+    var fableRate = onFable ? sevenRateEff : 0;
+    fableState = project(fable.pct, fableRate, seven.hours_to_reset);
+    ageTxtOut = fableAge == null ? "" :
+        (fableAge < 1 ? "entered just now"
+         : fableAge < 24 ? ("entered " + Math.round(fableAge) + "h ago")
+         : ("entered " + Math.round(fableAge / 24) + "d ago"));
+    if (!fableFresh) ageTxtOut += " \u2014 stale, not driving the verdict";
+    fablePanel = panelHTML("Weekly \u00b7 Fable (entered)", {
+      pct: fable.pct,
+      rate: fableRate, rateDp: 2,
+      rateLabel: onFable ? "Planned pace" : "Planned pace (not on Fable)",
+      hoursToReset: seven.hours_to_reset,
+      resetLabel: fmtWhen(seven.next_reset_ms)
+    }, fableState);
+  }
+
+  // The binding constraint wins. A stale typed number informs but never drives.
   var worst = worstOf(fiveState.verdict, sevenState.verdict);
+  if (fableState && fableFresh) worst = worstOf(worst, fableState.verdict);
 
   // Ultracode read-out: what does the top effort stop (~2.5x fan-out) do to the
   // weekly window on the currently selected model? Same WTD base and band as
@@ -572,7 +645,8 @@ function render() {
   app.innerHTML =
     staleHtml +
     verdictBand(worst, fiveState, sevenState) +
-    '<div class="cols">' + fivePanel + sevenPanel + '</div>' +
+    '<div class="' + (fablePanel ? "cols3" : "cols") + '">' +
+      fivePanel + sevenPanel + fablePanel + '</div>' +
     '<div class="chartcard"><h2>Last 72 hours</h2>' +
       '<div class="legend"><span><i class="swatch" style="background:var(--accent)"></i>5-hour window</span>' +
       '<span><i class="swatch" style="background:var(--warn)"></i>7-day window</span></div>' +
@@ -595,11 +669,34 @@ function render() {
       '<div class="presets"><span class="plabel">Effective burn</span><b>' + mult.toFixed(1) + '×</b>' +
         '<span class="plabel" style="text-transform:none;letter-spacing:0">= ' + model.name + ' ' +
         model.mult.toFixed(1) + ' × ' + effort.name + ' ' + effort.mult.toFixed(1) + '</span></div>' +
+      '<div class="ctl"><label>Weekly \u00b7 Fable<small>per-model cap \u2014 type it from <code>/usage</code></small></label>' +
+        '<div class="manual">' +
+          '<input type="number" id="f-fable" min="0" max="100" step="1" placeholder="\u2014" value="' +
+            (fable ? fable.pct : "") + '">' +
+          '<span>%</span>' +
+          (fable ? '<span class="asof' + (fableFresh ? '' : ' old') + '">' + ageTxtOut + '</span>' +
+                   '<button type="button" id="f-fable-clear">clear</button>'
+                 : '<span class="asof">not tracked in the history file \u2014 enter it to model it</span>') +
+        '</div>' +
+        '<output>' + (fable ? Math.round(fable.pct) + "%" : "\u2014") + '</output></div>' +
       '<div class="ultra"><div class="u-ic">U</div><div class="u-body">' +
         '<b>Ultracode check.</b> ' + ultraMsg + '</div></div>' +
     '</div>';
 
   drawChart(MODEL.history);
+
+  // manual per-model cap: commit on change (not each keystroke) so a
+  // half-typed "9" of "95" doesn't briefly flash a wrong verdict.
+  var fEl = document.getElementById("f-fable");
+  if (fEl) fEl.addEventListener("change", function () {
+    var v = parseFloat(fEl.value);
+    writeFable(isFinite(v) ? v : null);
+    render();
+  });
+  var fClear = document.getElementById("f-fable-clear");
+  if (fClear) fClear.addEventListener("click", function () {
+    writeFable(null); render();
+  });
 
   // rewire the sliders (innerHTML replaced them)
   ["f-active", "f-effort"].forEach(function (id) {
