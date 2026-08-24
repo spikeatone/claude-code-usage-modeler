@@ -331,6 +331,7 @@ function panelHTML(title, meta, state) {
                   state.verdict === "over" ? "warn" : "");
   rows += metaRow("Projected at reset", projLabel,
                   state.verdict === "over" ? "warn" : (state.verdict === "clear" ? "good" : ""));
+  if (meta.stretchHtml) rows += metaRow("Past finishes from here", meta.stretchHtml);
   return '<div class="panel">' +
     '<h2>' + title + '<span class="pill ' + cls + '">' + state.verdict + '</span></h2>' +
     '<div class="pct tabnum">' + Math.round(meta.pct) + '<small>%</small></div>' +
@@ -354,7 +355,7 @@ function verdictBand(worst, fiveState, sevenState) {
       ? "At this pace the weekly limit runs out before it resets. Ease off, or you'll hit the wall like last week."
       : "This 5-hour burst will top out the session window before it rolls over.";
   } else if (worst === "tight") {
-    say = "You're on track to finish the window right around the limit — not much headroom. Fine to keep going, but watch it.";
+    say = (window._bustNote || "You're on track to finish the window right around the limit — not much headroom.") + " Fine to keep going, but watch it.";
   } else {
     say = "Comfortably inside both windows. Room to push more sessions, and Ultracode is affordable from here — model it below.";
   }
@@ -554,10 +555,29 @@ function render() {
     pct: five.pct, rate: fiveRateEff, rateDp: 1,
     hoursToReset: fiveHorizon, resetLabel: fiveReset
   }, fiveState);
+  // Replay each completed week's final stretch from today's number, scaled
+  // by the what-if factor. "1 of your 3 past finishes would cap out from
+  // here" is the sentence that makes a TIGHT pill explain itself.
+  var factor = (activeHours / impliedActive) * mult;
+  var outcomes = (seven.final_stretch_gains || []).map(function (g) {
+    return Math.round(seven.pct + Math.max(0, g) * factor);
+  });
+  var busts = outcomes.filter(function (o) { return o >= 100; }).length;
+  window._bustNote = null;
+  if (busts > 0 && outcomes.length) {
+    window._bustNote = busts + " of your " + outcomes.length +
+      " past final-stretches would top out the weekly limit from here" +
+      (burst <= 0.05 ? " (nothing says you will — you're idle right now)" : "") + ".";
+  }
+  var stretchHtml = outcomes.length ? outcomes.map(function (o) {
+    return o >= 100 ? '<span class="warn" style="color:var(--warn)">' + o + '%</span>' : o + '%';
+  }).join(" / ") : null;
+
   var sevenPanel = panelHTML("7-day weekly window", {
     pct: seven.pct, rate: sevenRateEff, rateDp: 2,
     rateLabel: "Week-to-date pace", rate2: burst * mult,
-    hoursToReset: seven.hours_to_reset, resetLabel: fmtWhen(seven.next_reset_ms)
+    hoursToReset: seven.hours_to_reset, resetLabel: fmtWhen(seven.next_reset_ms),
+    stretchHtml: stretchHtml
   }, sevenState);
 
   // Ultracode read-out: what does the top effort stop (~2.5x fan-out) do to the

@@ -282,6 +282,30 @@ def _max_gain_over(samples, resets, dur_h):
     return best
 
 
+def _final_stretch_gains(samples, resets, rem_h):
+    """How many sd points each completed week added in its FINAL `rem_h` hours.
+
+    The most legible answer to "is 66% with 2 days left actually tight?":
+    replay your own past final-stretches from today's number. A verdict that
+    can say "1 of your 3 past finishes would cap out from here" explains
+    itself; a bare pill doesn't.
+    """
+    if rem_h is None or rem_h <= 0:
+        return []
+    gains = []
+    for w in range(len(resets) - 1):
+        a, b = resets[w], resets[w + 1]
+        pts = [s for s in samples if a <= s["t"] < b]
+        if len(pts) < 10:
+            continue
+        cutoff = b - rem_h * 3600_000
+        before = [p["sd"] for p in pts if p["t"] <= cutoff]
+        if not before:
+            continue                      # window shorter than the stretch
+        gains.append(round(pts[-1]["sd"] - before[-1], 1))
+    return gains
+
+
 def _fh_window_start(samples, now_ms):
     """Approximate start of the live 5-hour window, or None if unknowable.
 
@@ -469,6 +493,8 @@ def load_usage(path=None, now_ms=None):
             "proj_low": round(proj_low, 1) if proj_low is not None else None,
             "proj_high": round(proj_high, 1) if proj_high is not None else None,
             "max_gain_pts": round(max_gain, 1) if max_gain is not None else None,
+            "final_stretch_gains": _final_stretch_gains(samples, resets,
+                                                        hours_to_weekly),
             "next_reset_ms": int(next_reset_dt.timestamp() * 1000) if next_reset_dt else None,
             "hours_to_reset": round(hours_to_weekly, 2) if hours_to_weekly is not None else None,
             "anchor": anchor, "prev_window_peak": prev_peak, **seven_d,
