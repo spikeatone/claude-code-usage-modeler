@@ -86,20 +86,35 @@ def test_single_sample_no_crash():
     assert U._burn_rate([_s(0, 5, 5)], "fh", 0) == 0.0
 
 
-def test_anchor_follows_moved_reset():
-    # Three Tuesday resets, then the account's reset moves to a Wednesday
-    # morning (this really happened). The anchor must follow the newest reset,
-    # not vote for the historically dominant weekday.
-    tue = datetime.datetime(2026, 8, 11, 22, 10)
-    wed = datetime.datetime(2026, 8, 19, 9, 18)
-    resets = [int((tue - datetime.timedelta(days=14)).timestamp() * 1000),
-              int((tue - datetime.timedelta(days=7)).timestamp() * 1000),
-              int(tue.timestamp() * 1000),
-              int(wed.timestamp() * 1000)]
-    anchor = U._weekly_anchor(resets)
-    assert anchor["weekday"] == wed.weekday(), anchor
-    nxt = U._next_weekly_reset(anchor, datetime.datetime(2026, 8, 23, 12, 0))
-    assert nxt == wed + datetime.timedelta(days=7), nxt
+def test_anchor_survives_sampling_gap():
+    # Real case: three tight Tuesday-21:00 resets, then the machine sleeps
+    # over the fourth - last sample Tue 17:49, next Wed 09:18. The naive
+    # timestamp would move the anchor to Wednesday morning; bracketing must
+    # keep it on Tuesday ~21:00.
+    def br(after, before):
+        return {"after": int(after.timestamp() * 1000),
+                "before": int(before.timestamp() * 1000)}
+    dt = datetime.datetime
+    resets = [br(dt(2026, 7, 28, 20, 58), dt(2026, 7, 28, 21, 3)),
+              br(dt(2026, 8, 4, 20, 59), dt(2026, 8, 4, 21, 3)),
+              br(dt(2026, 8, 11, 20, 57), dt(2026, 8, 11, 21, 2)),
+              br(dt(2026, 8, 18, 17, 49), dt(2026, 8, 19, 9, 18))]   # 15.5h gap
+    a = U._weekly_anchor(resets)
+    assert a["weekday"] == 1, a          # Tuesday, not Wednesday
+    assert a["hour"] == 20 or a["hour"] == 21, a
+    nxt = U._next_weekly_reset(a, dt(2026, 8, 24, 12, 0))
+    assert nxt.weekday() == 1, nxt
+    assert nxt.date() == datetime.date(2026, 8, 25), nxt
+
+
+def test_anchor_all_gaps_uses_midpoint():
+    # No tight bracket anywhere: fall back to the newest bracket's midpoint
+    # rather than its (late) trailing edge.
+    dt = datetime.datetime
+    resets = [{"after": int(dt(2026, 8, 18, 18, 0).timestamp() * 1000),
+               "before": int(dt(2026, 8, 19, 6, 0).timestamp() * 1000)}]
+    a = U._weekly_anchor(resets)
+    assert a["hour"] == 0, a             # midpoint of 18:00 -> 06:00
 
 
 def test_fh_window_start_from_idle_climb():
@@ -127,7 +142,7 @@ def test_active_rate_uses_current_week_only():
     samples = [_s(0, 90, 10), _s(50, 90, 80),            # previous week - ignored
                _s(100, 5, 0),                             # reset
                _s(100.5, 20, 1), _s(101, 30, 2), _s(101.5, 40, 3)]
-    a = U._active_rate(samples, [int(100 * H)], int(101.5 * H))
+    a = U._active_rate(samples, [{"after": int(100 * H), "before": int(100 * H)}], int(101.5 * H))
     assert a is not None, a
     assert abs(a["active_hours"] - 1.5) < 1e-6, a
     assert abs(a["rate_per_h"] - 2.0) < 0.01, a   # 3 pts / 1.5h
@@ -136,7 +151,7 @@ def test_active_rate_uses_current_week_only():
 def test_active_rate_skips_idle_and_gaps():
     # fh<=2 the whole time = idle; no active hours to measure.
     samples = [_s(0, 0, 0), _s(1, 1, 0), _s(2, 2, 0), _s(3, 1, 0)]
-    assert U._active_rate(samples, [0], int(3 * H)) is None
+    assert U._active_rate(samples, [{"after": 0, "before": 0}], int(3 * H)) is None
 
 
 def run():

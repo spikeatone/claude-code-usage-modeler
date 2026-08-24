@@ -148,28 +148,61 @@ def _burn_rate(samples, key, now_ms):
 
 
 def _weekly_resets(samples):
-    """Timestamps (ms) where the 7-day window dropped sharply = a weekly reset."""
-    resets = []
+    """Reset instants (ms), bracketed to survive sampling gaps.
+
+    A reset is a sharp drop in `sd`. The naive timestamp is the first sample
+    AFTER the drop - but sampling stops whenever Claude Code isn't running, so
+    a machine asleep overnight reports the reset hours late. (Real case: the
+    last sample before a reset was Tue 17:49 at 100%, the next was Wed 09:18
+    at 0% - a 15.5h gap that made a Tue 21:00 reset look like Wed 09:18 and
+    dragged the whole anchor onto the wrong weekday.)
+
+    Each reset is returned as {"after": <last sample before>, "before": <first
+    sample after>}: the true instant lies in that bracket. `_weekly_anchor`
+    picks the point in the bracket that fits the observed weekly cadence.
+    """
+    out = []
     for a, b in zip(samples, samples[1:]):
         if a["sd"] - b["sd"] >= RESET_DROP:
-            resets.append(b["t"])
-    return resets
+            out.append({"after": a["t"], "before": b["t"]})
+    return out
+
+
+def _reset_times(resets):
+    """Just the bracket end (first observed sample after each reset)."""
+    return [r["before"] for r in resets]
 
 
 def _weekly_anchor(resets):
-    """Anchor the weekly cadence to the *most recent* observed reset.
+    """Infer the weekly reset instant, tolerant of gaps in the samples.
 
-    An earlier version voted for the dominant weekday across recent resets.
-    That backfired in practice: when Anthropic moved this account's reset from
-    Tue ~22:00 to Wed ~09:18 (observed 2026-08-19), the vote kept projecting
-    Tuesdays - ~35h off. The newest reset is simply the truth; history adds
-    nothing once the anchor moves.
+    Anchoring naively to the newest reset's post-drop timestamp is wrong when
+    that sample landed after a sampling gap. So: take the newest reset whose
+    bracket is tight (the machine was awake across it) and roll it forward in
+    whole weeks to the newest reset's bracket. If every bracket is loose, fall
+    back to the midpoint of the newest one - still better than its late edge.
     """
     if not resets:
         return None
-    ref = datetime.datetime.fromtimestamp(resets[-1] / 1000)
-    return {"weekday": ref.weekday(), "hour": ref.hour, "minute": ref.minute,
-            "last_reset_ms": resets[-1]}
+    newest = resets[-1]
+    week_ms = WEEK_DAYS * 24 * 3600_000
+
+    # A bracket under ~35 min pins the instant well (sampling is ~5-15 min).
+    tight = [r for r in resets if r["before"] - r["after"] <= 35 * 60_000]
+    if tight:
+        ref = tight[-1]
+        # Midpoint of a tight bracket is within minutes of the true instant.
+        instant = (ref["after"] + ref["before"]) // 2
+        # Roll forward in whole weeks until it lands in/after the newest reset's
+        # bracket, so the anchor reflects the most recent cycle.
+        while instant + week_ms <= newest["before"]:
+            instant += week_ms
+    else:
+        instant = (newest["after"] + newest["before"]) // 2
+
+    ref_dt = datetime.datetime.fromtimestamp(instant / 1000)
+    return {"weekday": ref_dt.weekday(), "hour": ref_dt.hour,
+            "minute": ref_dt.minute, "last_reset_ms": instant}
 
 
 def _next_weekly_reset(anchor, now_dt):
@@ -197,7 +230,7 @@ def _active_rate(samples, resets, now_ms):
     time (active = the 5h window shows live usage, fh > 2) - and the page's
     sliders turn that into a plan. Sampling gaps over 30 min read as idle.
     """
-    start = resets[-1] if resets else now_ms - 7 * 24 * 3600_000
+    start = resets[-1]["before"] if resets else now_ms - 7 * 24 * 3600_000
     week = [s for s in samples if s["t"] >= start]
     gain = 0.0
     hours = 0.0
