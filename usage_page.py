@@ -88,7 +88,9 @@ PAGE = r"""<!doctype html>
   .manual input[type=number] { font:inherit; font-size:14px; width:76px;
     color:var(--ink); background:var(--bg); border:1px solid var(--line);
     border-radius:8px; padding:5px 8px; font-variant-numeric:tabular-nums; }
-  .manual input[type=number]:focus { outline:none; border-color:var(--accent); }
+  .manual input[type=number]:focus, .manual input[type=date]:focus { outline:none; border-color:var(--accent); }
+  .manual input[type=date] { font:inherit; font-size:13px; color:var(--ink);
+    background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:5px 8px; }
   .manual .asof { font-size:12px; }
   .manual .asof.old { color:var(--review); }
   .manual button { font:inherit; font-size:12px; color:var(--muted);
@@ -513,6 +515,7 @@ function pollNow() {
 // NOT written to plan-usage-history.json, so it can't be read from disk. The
 // user types it; we stamp when, because a typed number goes stale in a way a
 // sampled one doesn't - past ~6h we stop letting it drive the verdict.
+var BOOST_KEY = "usage.boostUntil";      // ISO date, e.g. "2026-09-13"
 var FABLE_KEY = "usage.fablePct", FABLE_AT = "usage.fablePctAt";
 var FABLE_STALE_H = 6;
 
@@ -535,6 +538,25 @@ function writeFable(pct) {
     }
   } catch (e) { /* storage off - just don't persist */ }
 }
+// Anthropic sometimes grants a temporary limit boost ("your weekly limit is
+// 50% higher through <date>"). Percentages already account for it, so the
+// gauges stay correct - but the same work costs proportionally more percent
+// once it lapses, so the page warns as the date approaches and after it.
+function readBoost() {
+  try {
+    var v = localStorage.getItem(BOOST_KEY);
+    if (!v) return null;
+    var d = new Date(v + "T23:59:59");
+    if (isNaN(d.getTime())) return null;
+    return { until: d, daysLeft: (d - Date.now()) / 86400000 };
+  } catch (e) { return null; }
+}
+function writeBoost(v) {
+  try {
+    if (v) localStorage.setItem(BOOST_KEY, v); else localStorage.removeItem(BOOST_KEY);
+  } catch (e) {}
+}
+
 function fableAgeH(f) {
   return (f && f.at) ? (Date.now() - f.at) / 3600000 : null;
 }
@@ -672,8 +694,24 @@ function render() {
       '. Percentages are as of then; time-to-reset is current.</div>';
   }
 
+  var boost = readBoost();
+  var boostHtml = "";
+  if (boost) {
+    if (boost.daysLeft >= 0) {
+      boostHtml = '<div class="stale-banner">Weekly limit <b>temporarily boosted</b> through ' +
+        boost.until.toLocaleDateString(undefined, {month: "long", day: "numeric"}) +
+        ' (' + Math.ceil(boost.daysLeft) + ' day' + (Math.ceil(boost.daysLeft) === 1 ? '' : 's') +
+        ' left). The percentages below already account for it \u2014 but the same work ' +
+        'will use proportionally more of the bar once it lapses.</div>';
+    } else {
+      boostHtml = '<div class="stale-banner">Your limit boost <b>ended ' +
+        boost.until.toLocaleDateString(undefined, {month: "long", day: "numeric"}) +
+        '</b>. Expect the weekly bar to climb faster than it did during the boost.</div>';
+    }
+  }
+
   app.innerHTML =
-    staleHtml +
+    boostHtml + staleHtml +
     verdictBand(worst, fiveState, sevenState) +
     '<div class="' + (fablePanel ? "cols3" : "cols") + '">' +
       fivePanel + sevenPanel + fablePanel + '</div>' +
@@ -709,6 +747,13 @@ function render() {
                  : '<span class="asof">not tracked in the history file \u2014 enter it to model it</span>') +
         '</div>' +
         '<output>' + (fable ? Math.round(fable.pct) + "%" : "\u2014") + '</output></div>' +
+      '<div class="ctl"><label>Limit boost ends<small>from <code>/usage</code>, if your limits are boosted</small></label>' +
+        '<div class="manual">' +
+          '<input type="date" id="f-boost" value="' +
+            (boost ? boost.until.toISOString().slice(0, 10) : "") + '">' +
+          (boost ? '<button type="button" id="f-boost-clear">clear</button>' : '') +
+        '</div>' +
+        '<output>' + (boost ? (boost.daysLeft >= 0 ? Math.ceil(boost.daysLeft) + "d" : "ended") : "\u2014") + '</output></div>' +
       '<div class="ultra"><div class="u-ic">U</div><div class="u-body">' +
         '<b>Ultracode check.</b> ' + ultraMsg + '</div></div>' +
     '</div>';
@@ -723,6 +768,11 @@ function render() {
     writeFable(isFinite(v) ? v : null);
     render();
   });
+  var bEl = document.getElementById("f-boost");
+  if (bEl) bEl.addEventListener("change", function () { writeBoost(bEl.value || null); render(); });
+  var bClear = document.getElementById("f-boost-clear");
+  if (bClear) bClear.addEventListener("click", function () { writeBoost(null); render(); });
+
   var fClear = document.getElementById("f-fable-clear");
   if (fClear) fClear.addEventListener("click", function () {
     writeFable(null); render();
