@@ -154,6 +154,30 @@ def test_active_rate_skips_idle_and_gaps():
     assert U._active_rate(samples, [{"after": 0, "before": 0}], int(3 * H)) is None
 
 
+def test_active_rate_flags_thin_measurement():
+    # ~2 active hours right after a reset must NOT be treated as a usable pace
+    # (extrapolated over a fresh week it produced a 216% projection from 0%).
+    samples = []
+    t = 0.0
+    sd = 0.0
+    while t < 2.0:                      # 2h of active samples, small gain
+        samples.append(_s(t, 20, sd))
+        sd += 0.2
+        t += 0.25
+    a = U._active_rate(samples, [{"after": 0, "before": 0}], int(2 * H))
+    assert a is not None and a["reliable"] is False, a
+    # ...but a full working day of it is fine.
+    samples = []
+    t = 0.0
+    sd = 0.0
+    while t < 9.0:
+        samples.append(_s(t, 20, sd))
+        sd += 0.15
+        t += 0.25
+    b = U._active_rate(samples, [{"after": 0, "before": 0}], int(9 * H))
+    assert b["reliable"] is True, b
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0

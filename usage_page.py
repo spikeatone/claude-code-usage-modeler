@@ -70,6 +70,10 @@ PAGE = r"""<!doctype html>
     flex-wrap:wrap; gap:8px; margin-bottom:6px; }
   h1 { font-size:22px; margin:0; letter-spacing:-0.01em; }
   .back { font-size:13px; text-decoration:none; }
+  .hnav { display:flex; gap:14px; align-items:baseline; flex-wrap:wrap; }
+  /* Inside the dashboard hub (an iframe), the hub's own tab bar is the sole
+     navigator; hide these cross-links so they can't break out of the frame. */
+  .framed .xnav { display:none; }
   .sub { color:var(--muted); font-size:13px; margin-bottom:22px; }
   .tabnum { font-variant-numeric:tabular-nums; }
 
@@ -227,12 +231,23 @@ PAGE = r"""<!doctype html>
   .w-muted { color:var(--muted); font-size:12.5px; }
   .w-poll-dot { width:8px; height:8px; border-radius:50%; background:var(--line); }
 </style>
+<script>
+  // Mark <html> as framed when embedded (e.g. in the dashboards hub) so in-page
+  // cross-nav links hide and can't break the hub's tab shell. Runs before render.
+  try { if (window.top !== window.self) document.documentElement.className += " framed"; } catch (e) { document.documentElement.className += " framed"; }
+</script>
 </head>
 <body>
   <div class="wrap">
     <header>
       <h1>Claude Code usage</h1>
-      <a class="back" href="/" onclick="location.reload();return false;">&#8635; refresh</a>
+      <span class="hnav">
+        <span class="xnav">
+          <a class="back" href="http://127.0.0.1:8080/dashboard.html" target="_top" title="Portfolio status dashboard (run its serve.py on :8080)">Portfolio</a>
+          <a class="back" href="http://127.0.0.1:8080/tech-ops-dashboard.html" target="_top" title="Tech Ops alignment matrix (run the App Marketing serve.py on :8080)">Tech Ops</a>
+        </span>
+        <a class="back" href="/" onclick="location.reload();return false;">&#8635; refresh</a>
+      </span>
     </header>
     <div class="sub" id="sub">how your usage is tracking against the reset.</div>
     <div id="app"></div>
@@ -316,7 +331,9 @@ function panelHTML(title, meta, state) {
   var projLabel = projShow == null ? "\u2014" :
       (projShow > 100 ? (projShow + "% \u2014 over by " + (projShow - 100)) : projShow + "%");
   var rows = '';
-  rows += metaRow(meta.rateLabel || "Burn rate now", meta.rate.toFixed(meta.rateDp) + " pts/hr");
+  rows += metaRow(meta.rateLabel || "Burn rate now",
+                  meta.rate.toFixed(meta.rateDp) + " pts/hr" +
+                  (meta.rateNote ? ' <span style="font-weight:400;color:var(--muted)">(' + meta.rateNote + ')</span>' : ''));
   if (meta.rate2 != null) rows += metaRow("Burst rate (last ~2h)", meta.rate2.toFixed(2) + " pts/hr");
   if (meta.resetLabel) rows += metaRow("Window resets", meta.resetLabel);
   rows += metaRow("Time to reset", fmtHours(meta.hoursToReset));
@@ -550,10 +567,20 @@ function render() {
 
   // The plan: your slider hours/day at the measured pace-while-active for
   // THIS week, times model x effort. Nothing from past weeks feeds this.
-  var activeRate = (seven.active && seven.active.rate_per_h) || seven.rate_per_h || 0;
+  // Measured pace while working, from THIS week only. Right after a reset
+  // there isn't enough of it to mean anything - extrapolating 2 active hours
+  // across a fresh week produced a 216% "PULL BACK" from 0%. When the server
+  // says the measurement isn't solid yet we don't project from it at all; the
+  // sliders become a pure what-if ("if I work like this, here's where I land")
+  // and the panel says the pace is still being measured.
+  var actObj = seven.active || null;
+  var rateReliable = !!(actObj && actObj.reliable);
+  var activeRate = actObj ? actObj.rate_per_h : (seven.rate_per_h || 0);
   var burst = seven.rate_per_h || 0;
   var sevenRateEff = activeRate * (activeHours / 24) * mult;
-  var sevenState = project(seven.pct, sevenRateEff, seven.hours_to_reset);
+  var sevenState = rateReliable
+      ? project(seven.pct, sevenRateEff, seven.hours_to_reset)
+      : { hoursToFull: null, pctAtReset: null, verdict: "clear" };
   // 5-hour window: the live burst over the real remaining horizon.
   var fiveRateEff = five.rate_per_h * mult;
   var fiveHorizon = five.horizon_h != null ? five.horizon_h : five.window_h;
@@ -568,6 +595,8 @@ function render() {
   }, fiveState);
   var sevenPanel = panelHTML("7-day weekly window", {
     pct: seven.pct, rate: sevenRateEff, rateDp: 2,
+    rateNote: rateReliable ? null : ("measuring \u2014 " +
+      (actObj ? actObj.active_hours + "h active so far this week" : "no active time yet")),
     rateLabel: "Planned pace", rate2: burst * mult,
     hoursToReset: seven.hours_to_reset, resetLabel: fmtWhen(seven.next_reset_ms)
   }, sevenState);
@@ -608,7 +637,8 @@ function render() {
   var resetDay = seven.next_reset_ms
       ? ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][new Date(seven.next_reset_ms).getDay()]
       : "the reset";
-  var ultraOn = project(seven.pct, activeRate * (activeHours / 24) * model.mult * 2.5,
+  var ultraOn = !rateReliable ? {verdict: "unknown", pctAtReset: null} :
+      project(seven.pct, activeRate * (activeHours / 24) * model.mult * 2.5,
                         seven.hours_to_reset);
   var ultraMsg;
   if (seven.pct >= 99) {

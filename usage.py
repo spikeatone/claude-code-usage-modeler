@@ -70,6 +70,12 @@ BURN_LOOKBACK_H = 2.0
 # don't produce a wild slope. If the recent window is too short we widen it.
 BURN_MIN_SPAN_H = 0.5
 
+# A measured active-pace needs at least this much active time AND this many
+# points of movement behind it before the page will extrapolate it over a
+# whole week. Below either bar the number is shown but marked unreliable.
+MIN_ACTIVE_H = 4.0
+MIN_ACTIVE_GAIN = 3.0
+
 FIVE_HOUR = 5.0
 WEEK_DAYS = 7
 
@@ -241,10 +247,18 @@ def _active_rate(samples, resets, now_ms):
         if a["fh"] > 2 or b["fh"] > 2:
             hours += gap_h
             gain += max(0.0, b["sd"] - a["sd"])
-    if hours < 1:
-        return None                   # not enough active time to measure yet
-    return {"rate_per_h": round(gain / hours, 3),
-            "active_hours": round(hours, 1)}
+    # A rate measured over a sliver of active time is noise, not a pace: right
+    # after a reset one busy hour would otherwise be extrapolated across the
+    # whole week (seen live: 2.1 active hours read as 3.9 pts/hr -> a 216%
+    # projection from 0%). Report the measurement either way, but flag whether
+    # it is solid enough to drive a projection; the page falls back to a
+    # neutral plan-it-yourself state when it isn't.
+    if hours <= 0:
+        return None
+    rate = gain / hours
+    return {"rate_per_h": round(rate, 3),
+            "active_hours": round(hours, 1),
+            "reliable": hours >= MIN_ACTIVE_H and gain >= MIN_ACTIVE_GAIN}
 
 
 def _fh_window_start(samples, now_ms):
