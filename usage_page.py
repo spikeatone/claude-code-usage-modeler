@@ -97,6 +97,31 @@ PAGE = r"""<!doctype html>
     background:none; border:1px solid var(--line); border-radius:7px;
     padding:3px 10px; cursor:pointer; }
   .manual button:hover { border-color:var(--accent); color:var(--accent); }
+  /* live activity: which session is burning tokens right now */
+  .livecard { margin-top:16px; background:var(--card); border:1px solid var(--line);
+    border-radius:14px; padding:18px 20px; }
+  .livecard h2 { font-size:13px; margin:0 0 4px; text-transform:uppercase;
+    letter-spacing:.05em; color:var(--muted); font-weight:600;
+    display:flex; justify-content:space-between; align-items:baseline; }
+  .livecard .hint { color:var(--muted); font-size:12.5px; margin-bottom:14px; }
+  .lrow { display:grid; grid-template-columns:1fr 96px 74px 58px; gap:12px;
+    align-items:center; padding:7px 0; border-top:1px solid var(--line);
+    font-size:13.5px; }
+  .lrow:first-of-type { border-top:none; }
+  .lname { display:flex; align-items:center; gap:8px; min-width:0; }
+  .lname b { font-weight:600; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; }
+  .lmodel { font-size:11px; padding:2px 8px; border-radius:20px; flex:none;
+    background:var(--build-bg); color:var(--build); font-weight:600; }
+  .lmodel.pricey { background:var(--dev-bg); color:var(--dev); }
+  .lmodel.cheap { background:var(--live-bg); color:var(--ready); }
+  .lbar { height:7px; border-radius:4px; background:var(--track); overflow:hidden; }
+  .lbar i { display:block; height:100%; background:var(--accent); border-radius:4px; }
+  .lbar i.pricey { background:var(--dev); }
+  .lnum { text-align:right; font-variant-numeric:tabular-nums; color:var(--muted);
+    font-size:12.5px; }
+  .lshare { text-align:right; font-weight:700; font-variant-numeric:tabular-nums; }
+  .lidle { color:var(--muted); font-size:13px; }
   .cols3 { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
   @media (max-width:900px) { .cols3 { grid-template-columns:1fr; } }
 
@@ -561,6 +586,55 @@ function fableAgeH(f) {
   return (f && f.at) ? (Date.now() - f.at) / 3600000 : null;
 }
 
+// Which session is burning tokens right now. The percentage meters say how
+// much budget is left but never which of several open Claude Code sessions
+// spent it - the gap that made "the modeler is broken" look true when the
+// real answer was "another window is on Fable". Reads the same transcripts
+// Claude Code writes; weights by relative model price so a quiet expensive
+// session outranks a chatty cheap one.
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+    return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c];
+  });
+}
+function fmtTokens(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(0) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(0) + "K";
+  return String(n);
+}
+function liveHTML(rows) {
+  if (!rows || !rows.length) {
+    return '<div class="livecard"><h2>Burning right now <span style="font-weight:400;text-transform:none;letter-spacing:0">last hour</span></h2>' +
+      '<div class="lidle">No Claude Code activity in the last hour.</div></div>';
+  }
+  var top = rows.slice(0, 6);
+  var body = top.map(function (r) {
+    var cls = r.cost_weight > 1 ? " pricey" : (r.cost_weight < 1 ? " cheap" : "");
+    var mins = Math.round((Date.now() - r.last_ms) / 60000);
+    var when = mins < 2 ? "now" : (mins < 60 ? mins + "m ago" : Math.round(mins / 60) + "h ago");
+    return '<div class="lrow">' +
+      '<div class="lname"><b>' + escapeHtml(r.project) + '</b>' +
+        '<span class="lmodel' + cls + '">' + escapeHtml(r.model_label) +
+        (r.cost_weight !== 1 ? " " + r.cost_weight + "\u00d7" : "") + '</span>' +
+        (r.subagent ? '<span class="lmodel">sub</span>' : '') + '</div>' +
+      '<div class="lbar"><i class="' + (r.cost_weight > 1 ? "pricey" : "") +
+        '" style="width:' + Math.max(2, r.share) + '%"></i></div>' +
+      '<div class="lnum">' + fmtTokens(r.tokens) + ' \u00b7 ' + when + '</div>' +
+      '<div class="lshare">' + Math.round(r.share) + '%</div></div>';
+  }).join("");
+  var pricey = rows.filter(function (r) { return r.cost_weight > 1; });
+  var note = pricey.length
+    ? '<b>' + escapeHtml(pricey[0].project) + '</b> is on ' +
+      escapeHtml(pricey[0].model_label) + ' (' + pricey[0].cost_weight +
+      '\u00d7 Opus per token) \u2014 ' + Math.round(pricey[0].share) + '% of this hour\u2019s weighted spend.'
+    : 'Share is weighted by model price, so this ranks what each session actually costs \u2014 not just how chatty it is.';
+  return '<div class="livecard">' +
+    '<h2>Burning right now <span style="font-weight:400;text-transform:none;letter-spacing:0">last hour \u00b7 ' +
+      rows.length + ' session' + (rows.length === 1 ? '' : 's') + '</span></h2>' +
+    '<div class="hint">' + note + '</div>' + body + '</div>';
+}
+
 function render() {
   var app = document.getElementById("app");
   if (!MODEL || !MODEL.available) { renderOnboarding(app); return; }
@@ -715,6 +789,7 @@ function render() {
     verdictBand(worst, fiveState, sevenState) +
     '<div class="' + (fablePanel ? "cols3" : "cols") + '">' +
       fivePanel + sevenPanel + fablePanel + '</div>' +
+    liveHTML(MODEL.live) +
     '<div class="chartcard"><h2>Last 72 hours</h2>' +
       '<div class="legend"><span><i class="swatch" style="background:var(--accent)"></i>5-hour window</span>' +
       '<span><i class="swatch" style="background:var(--warn)"></i>7-day window</span></div>' +

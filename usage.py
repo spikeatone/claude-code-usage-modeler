@@ -421,7 +421,114 @@ def load_usage(path=None, now_ms=None):
             "anchor": anchor, **seven_d,
         },
         "history": hist,
+        # Who is burning tokens right now. The meters say how much is left;
+        # this says which session spent it - the question they can't answer.
+        "live": scan_live_activity(1.0, now_ms),
     }
+
+
+# Relative token cost per model, from Anthropic's published API pricing
+# (input/output $ per MTok). Used only to weight "which session is actually
+# costing you the most" - the percentage meters remain the source of truth.
+MODEL_COST = {
+    "fable": 2.0,        # $10/$50  - 2x Opus
+    "mythos": 2.0,       # $10/$50
+    "opus": 1.0,         # $5/$25   - baseline
+    "sonnet": 0.4,       # $2/$10
+    "haiku": 0.2,        # $1/$5
+}
+
+
+def _cost_weight(model):
+    m = (model or "").lower()
+    for key, mult in MODEL_COST.items():
+        if key in m:
+            return mult
+    return 1.0
+
+
+def _pretty_model(model):
+    """'claude-opus-4-8' -> 'Opus 4.8'."""
+    m = (model or "?").replace("claude-", "")
+    for fam in ("fable", "mythos", "opus", "sonnet", "haiku"):
+        if m.startswith(fam):
+            ver = m[len(fam):].strip("-").replace("-", ".")
+            return fam.capitalize() + (" " + ver if ver else "")
+    return m
+
+
+def scan_live_activity(window_h=1.0, now_ms=None):
+    """Who is burning tokens right now, per session and model.
+
+    The percentage meters say HOW MUCH is left; they never say WHICH session
+    spent it. With several Claude Code sessions open at once that gap is the
+    difference between "the tool is broken" and "the Golf Course window is on
+    Fable". This streams the same transcripts Claude Code writes and buckets
+    recent assistant turns by session + model.
+
+    Cost weight is relative to Opus (Fable 2x, Sonnet 0.4x, Haiku 0.2x), so a
+    quiet Fable session outranks a chatty Sonnet one when it deserves to.
+    Returns [] rather than raising if anything is unreadable.
+    """
+    base = os.path.expanduser("~/.claude/projects")
+    if not os.path.isdir(base):
+        return []
+    ref = now_ms or int(datetime.datetime.now().timestamp() * 1000)
+    cutoff = ref - window_h * 3600_000
+    rows = {}
+    paths = glob.glob(os.path.join(base, "*", "*.jsonl"))
+    paths += glob.glob(os.path.join(base, "*", "*", "subagents", "*.jsonl"))
+    for path in paths:
+        try:
+            with open(path, errors="ignore") as handle:
+                for line in handle:
+                    if '"usage"' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if row.get("type") != "assistant":
+                        continue
+                    msg = row.get("message") or {}
+                    usage = msg.get("usage")
+                    ts = row.get("timestamp")
+                    if not usage or not ts:
+                        continue
+                    try:
+                        tms = datetime.datetime.fromisoformat(
+                            ts.replace("Z", "+00:00")).timestamp() * 1000
+                    except ValueError:
+                        continue
+                    if tms < cutoff:
+                        continue
+                    cwd = row.get("cwd") or ""
+                    key = (os.path.basename(cwd) or "?", msg.get("model") or "?")
+                    agg = rows.setdefault(key, {
+                        "project": key[0], "model": key[1], "turns": 0,
+                        "tokens": 0, "last_ms": 0, "subagent": False})
+                    agg["turns"] += 1
+                    agg["tokens"] += sum(usage.get(f, 0) or 0 for f in (
+                        "input_tokens", "output_tokens",
+                        "cache_read_input_tokens", "cache_creation_input_tokens"))
+                    agg["last_ms"] = max(agg["last_ms"], int(tms))
+                    if "/subagents/" in path:
+                        agg["subagent"] = True
+        except OSError:
+            continue
+    out = []
+    for agg in rows.values():
+        weight = _cost_weight(agg["model"])
+        agg["model_label"] = _pretty_model(agg["model"])
+        agg["cost_weight"] = weight
+        agg["weighted"] = int(agg["tokens"] * weight)
+        agg["tokens_per_h"] = int(agg["tokens"] / window_h)
+        out.append(agg)
+    out.sort(key=lambda r: -r["weighted"])
+    total = sum(r["weighted"] for r in out) or 1
+    for r in out:
+        r["share"] = round(100.0 * r["weighted"] / total, 1)
+    return out
 
 
 def scan_token_totals(window_hours=None, now_ms=None):
