@@ -573,7 +573,10 @@ function readBoost() {
     if (!v) return null;
     var d = new Date(v + "T23:59:59");
     if (isNaN(d.getTime())) return null;
-    return { until: d, daysLeft: (d - Date.now()) / 86400000 };
+    // Keep the raw "YYYY-MM-DD" string: re-deriving it with toISOString()
+    // converts to UTC and can land a day late for anyone behind it, which
+    // made the field redisplay 09-18 for a stored 09-17.
+    return { until: d, iso: v, daysLeft: (d - Date.now()) / 86400000 };
   } catch (e) { return null; }
 }
 function writeBoost(v) {
@@ -825,7 +828,7 @@ function render() {
       '<div class="ctl"><label>Limit boost ends<small>from <code>/usage</code>, if your limits are boosted</small></label>' +
         '<div class="manual">' +
           '<input type="date" id="f-boost" value="' +
-            (boost ? boost.until.toISOString().slice(0, 10) : "") + '">' +
+            (boost ? boost.iso : "") + '">' +
           (boost ? '<button type="button" id="f-boost-clear">clear</button>' : '') +
         '</div>' +
         '<output>' + (boost ? (boost.daysLeft >= 0 ? Math.ceil(boost.daysLeft) + "d" : "ended") : "\u2014") + '</output></div>' +
@@ -837,14 +840,43 @@ function render() {
 
   // manual per-model cap: commit on change (not each keystroke) so a
   // half-typed "9" of "95" doesn't briefly flash a wrong verdict.
+  // Same re-render-while-typing hazard as the date field above; commit on blur.
   var fEl = document.getElementById("f-fable");
-  if (fEl) fEl.addEventListener("change", function () {
-    var v = parseFloat(fEl.value);
-    writeFable(isFinite(v) ? v : null);
-    render();
-  });
+  if (fEl) {
+    var commitFable = function () {
+      var v = parseFloat(fEl.value);
+      writeFable(isFinite(v) ? v : null);
+      render();
+    };
+    fEl.addEventListener("blur", commitFable);
+    fEl.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); fEl.blur(); }
+    });
+  }
+  // A date input fires "change" as soon as the browser can parse what's been
+  // typed - which happens partway through the year ("09/17/0020"). Re-rendering
+  // then replaces the whole panel via innerHTML and destroys the field
+  // mid-typing, freezing that partial year in. So: commit on blur (or Enter),
+  // and reject a year that's obviously incomplete rather than storing it.
   var bEl = document.getElementById("f-boost");
-  if (bEl) bEl.addEventListener("change", function () { writeBoost(bEl.value || null); render(); });
+  if (bEl) {
+    var commitBoost = function () {
+      var v = bEl.value || null;
+      if (v) {
+        var year = parseInt(v.slice(0, 4), 10);
+        var nowYear = new Date().getFullYear();
+        if (!isFinite(year) || year < nowYear - 1 || year > nowYear + 5) {
+          return;                 // still mid-typing - leave the field alone
+        }
+      }
+      writeBoost(v);
+      render();
+    };
+    bEl.addEventListener("blur", commitBoost);
+    bEl.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); bEl.blur(); }
+    });
+  }
   var bClear = document.getElementById("f-boost-clear");
   if (bClear) bClear.addEventListener("click", function () { writeBoost(null); render(); });
 
