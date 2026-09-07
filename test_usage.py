@@ -178,6 +178,45 @@ def test_active_rate_flags_thin_measurement():
     assert b["reliable"] is True, b
 
 
+def test_anchor_ignores_off_schedule_zeroing():
+    # Real regression: four Tuesday ~21:00 resets, then a limit boost
+    # re-baselined the counter mid-week (Fri 14:00, sd 31 -> 0) with a TIGHT
+    # 15-minute bracket. Preferring the newest tight bracket moved the whole
+    # schedule to Friday 2pm and made every projection wrong. The largest
+    # group of mutually-overlapping brackets must win instead.
+    dt = datetime.datetime
+    def br(a, b):
+        return {"after": int(a.timestamp() * 1000), "before": int(b.timestamp() * 1000)}
+    resets = [
+        br(dt(2026, 8, 11, 16, 40), dt(2026, 8, 11, 22, 10)),   # wide, contains 21:00
+        br(dt(2026, 8, 18, 17, 49), dt(2026, 8, 19, 9, 18)),    # very wide (slept)
+        br(dt(2026, 8, 25, 19, 54), dt(2026, 8, 25, 21, 11)),   # tight, contains 21:00
+        br(dt(2026, 9, 4, 13, 52), dt(2026, 9, 4, 14, 7)),      # off-schedule boost
+    ]
+    a = U._weekly_anchor(resets)
+    assert a["weekday"] == 1, a                    # Tuesday, not Friday
+    assert 19 <= a["hour"] <= 21, a                # inside the Tuesday window
+    assert a["fit_votes"] >= 3, a
+    nxt = U._next_weekly_reset(a, dt(2026, 9, 7, 10, 0))
+    assert nxt.weekday() == 1, nxt
+
+
+def test_anchor_tight_bracket_pins_the_time():
+    # Intersecting brackets is as tight as the tightest member: one clean
+    # bracket should pin the minute even beside wide ones.
+    dt = datetime.datetime
+    def br(a, b):
+        return {"after": int(a.timestamp() * 1000), "before": int(b.timestamp() * 1000)}
+    resets = [
+        br(dt(2026, 8, 11, 16, 0), dt(2026, 8, 11, 23, 0)),     # wide
+        br(dt(2026, 8, 18, 20, 55), dt(2026, 8, 18, 21, 5)),    # tight: 21:00
+        br(dt(2026, 8, 25, 15, 0), dt(2026, 8, 25, 23, 30)),    # wide
+    ]
+    a = U._weekly_anchor(resets)
+    assert a["weekday"] == 1, a
+    assert a["hour"] == 21 and abs(a["minute"]) <= 5, a
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0

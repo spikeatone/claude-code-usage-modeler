@@ -180,35 +180,83 @@ def _reset_times(resets):
 
 
 def _weekly_anchor(resets):
-    """Infer the weekly reset instant, tolerant of gaps in the samples.
+    """Infer the weekly reset by finding the largest CONSISTENT set of brackets.
 
-    Anchoring naively to the newest reset's post-drop timestamp is wrong when
-    that sample landed after a sampling gap. So: take the newest reset whose
-    bracket is tight (the machine was awake across it) and roll it forward in
-    whole weeks to the newest reset's bracket. If every bracket is loose, fall
-    back to the midpoint of the newest one - still better than its late edge.
+    Two hazards make "trust the newest reset" wrong:
+
+      * Sampling gaps. The machine sleeps across a reset, so the first sample
+        after it lands hours late (a Tue 21:00 reset once read as Wed 09:18).
+        Each reset is a bracket: the true instant lies between the last sample
+        before the drop and the first sample after it.
+      * Off-schedule zeroings. `sd` drops to 0 mid-week for reasons that aren't
+        the weekly reset - a limit boost re-baselines the counter (observed
+        Fri 2026-09-04 31%->0, and Tue 2026-09-01 around noon). Trusting the
+        newest bracket, or the newest *tight* one, let a single such event move
+        the whole schedule to Friday 2pm and made every projection wrong.
+
+    A reset can only have occurred inside its bracket, so brackets that
+    describe the same weekly instant must OVERLAP once mapped onto a common
+    week. We therefore look for the largest mutually-overlapping group and
+    take the centre of its intersection: the intersection is as tight as the
+    tightest member, so one clean bracket pins the minute while wide ones just
+    fail to contradict it. Off-schedule drops don't overlap the real ones and
+    are outvoted. Ties break toward the more recent group, so a genuine
+    schedule change takes over once it has repeated.
     """
     if not resets:
         return None
-    newest = resets[-1]
     week_ms = WEEK_DAYS * 24 * 3600_000
 
-    # A bracket under ~35 min pins the instant well (sampling is ~5-15 min).
-    tight = [r for r in resets if r["before"] - r["after"] <= 35 * 60_000]
-    if tight:
-        ref = tight[-1]
-        # Midpoint of a tight bracket is within minutes of the true instant.
-        instant = (ref["after"] + ref["before"]) // 2
-        # Roll forward in whole weeks until it lands in/after the newest reset's
-        # bracket, so the anchor reflects the most recent cycle.
-        while instant + week_ms <= newest["before"]:
-            instant += week_ms
-    else:
+    def window_for(r, ref):
+        """`r`'s bracket mapped into the week containing `ref`."""
+        weeks = round(((r["after"] + r["before"]) / 2 - ref) / week_ms)
+        return (r["after"] - weeks * week_ms, r["before"] - weeks * week_ms)
+
+    best = None                      # (count, newest_ms, lo, hi)
+    for seed in resets:
+        ref = (seed["after"] + seed["before"]) / 2
+        # Start from the seed's own window, then intersect every other bracket
+        # that overlaps it. Seeding explicitly (rather than letting whichever
+        # bracket comes first claim the window) is what stops a lone
+        # off-schedule drop - the newest one - from defining the group.
+        lo, hi = window_for(seed, ref)
+        members = [seed]
+        for r in sorted(resets, key=lambda x: -x["before"]):
+            if r is seed:
+                continue
+            r_lo, r_hi = window_for(r, ref)
+            n_lo, n_hi = max(lo, r_lo), min(hi, r_hi)
+            if n_lo <= n_hi:
+                lo, hi, members = n_lo, n_hi, members + [r]
+        score = (len(members), max(m["before"] for m in members))
+        if best is None or score > best[0]:
+            best = (score, lo, hi)
+
+    if best is None:                 # nothing overlaps - fall back to newest
+        newest = resets[-1]
         instant = (newest["after"] + newest["before"]) // 2
+        votes = 1
+    else:
+        (votes, _), lo, hi = best
+        instant = int((lo + hi) // 2)
+
+    # Roll forward to the most recent cycle this anchor explains.
+    newest_seen = max((r["after"] + r["before"]) // 2 for r in resets)
+    while instant + week_ms <= newest_seen:
+        instant += week_ms
 
     ref_dt = datetime.datetime.fromtimestamp(instant / 1000)
     return {"weekday": ref_dt.weekday(), "hour": ref_dt.hour,
-            "minute": ref_dt.minute, "last_reset_ms": instant}
+            "minute": ref_dt.minute, "last_reset_ms": instant,
+            "fit_votes": votes, "candidates": len(resets)}
+
+
+def other_mid_offset(other_mid, cand_mid, week_ms):
+    """Signed distance from `other_mid` to the nearest multiple of a week away
+    from `cand_mid` - i.e. how far off the implied weekly cadence it sits."""
+    diff = other_mid - cand_mid
+    weeks = round(diff / week_ms)
+    return diff - weeks * week_ms
 
 
 def _next_weekly_reset(anchor, now_dt):
