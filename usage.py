@@ -310,24 +310,64 @@ def _active_rate(samples, resets, now_ms):
 
 
 def _fh_window_start(samples, now_ms):
-    """Approximate start of the live 5-hour window, or None if unknowable.
+    """Estimate when the live 5-hour window opened. Returns (ms, how) or None.
 
-    The fh series steps: it climbs while a session block is active and drops
-    when the block's window expires. The window opened at the last idle->climb
-    transition (or right after the last drop). Sampling is ~5min so this is
-    approximate - callers should present it as "~" - but it beats the old
-    behavior of always projecting a full fresh 5 hours.
+    Three strategies, best evidence first:
+
+      1. An observed reset - fh dropped sharply; the window re-opened there.
+      2. An observed idle->climb - fh sat at ~0 then started rising.
+      3. Back-extrapolation. Neither of the above is observable when sampling
+         only began mid-window, which is the common case: Claude Code samples
+         only while it's running, so a window that opened at 07:11 while the
+         machine was asleep has NO sample before 08:15 at fh=5. The series is
+         near-linear within a window, so we solve backwards from the current
+         level and the measured climb rate: start ~= now - pct/rate.
+
+    Strategy 3 is an estimate, so callers get `how` and should label it. It is
+    still far better than the old behaviour, which fell back to "a full fresh
+    5 hours" and told the user a window resetting in 57 minutes had 5h left.
     """
-    horizon = [s for s in samples if now_ms - s["t"] <= FIVE_HOUR * 3600_000]
+    window_ms = int(FIVE_HOUR * 3600_000)
+    horizon = [s for s in samples if now_ms - s["t"] <= window_ms]
     if len(horizon) < 2 or horizon[-1]["fh"] <= 2:
         return None                      # idle now, or nothing to see
+
+    # 1 & 2: an observable boundary inside the window.
     start = None
     for prev, cur in zip(horizon, horizon[1:]):
         if prev["fh"] - cur["fh"] >= RESET_DROP:
             start = cur["t"]             # window re-opened at the drop
         elif prev["fh"] <= 2 < cur["fh"]:
             start = prev["t"]            # climbed out of idle
-    return start
+    if start is not None:
+        return (start, "observed")
+
+    # 3: no boundary in view - the window opened before sampling resumed.
+    # Walk back to fh = 0 using the climb rate. Fit the rate over the EARLY
+    # part of the window, not the whole of it: a burst near the end (27 -> 42
+    # -> 51 in half an hour) inflates the average and drags the estimated
+    # start later, which is exactly the direction that makes the panel claim
+    # more time than the window really has. Use the first ~2/3 of the samples
+    # when there are enough, and anchor on the earliest sample rather than the
+    # latest so a late burst can't move the origin.
+    first, last = horizon[0], horizon[-1]
+    fit = horizon[:max(2, (len(horizon) * 2) // 3)]
+    f_first, f_last = fit[0], fit[-1]
+    span_h = (f_last["t"] - f_first["t"]) / 3600_000
+    gain = f_last["fh"] - f_first["fh"]
+    if span_h <= 0 or gain <= 0:         # early part flat - fall back to the whole
+        span_h = (last["t"] - first["t"]) / 3600_000
+        gain = last["fh"] - first["fh"]
+        f_first = first
+    if span_h <= 0 or gain <= 0:
+        return None                      # flat or going backwards - unknowable
+    rate = gain / span_h                 # points per hour
+    # Time for the earliest observed level to have accumulated at that rate.
+    est = f_first["t"] - int((f_first["fh"] / rate) * 3600_000)
+    # A window can't be older than its own length, and can't start in the future.
+    est = max(est, now_ms - window_ms)
+    est = min(est, now_ms)
+    return (est, "estimated")
 
 
 def _project(pct, rate_per_h, hours_to_reset):
@@ -411,12 +451,14 @@ def load_usage(path=None, now_ms=None):
     # session block and drops ~5h after the block began. Estimate the live
     # window's start so the projection horizon is the time actually left, not
     # a fresh 5 hours every render.
-    fh_start = _fh_window_start(samples, now_ms)
-    if fh_start is not None:
+    fh_found = _fh_window_start(samples, now_ms)
+    if fh_found is not None:
+        fh_start, fh_how = fh_found
         fh_resets_by = fh_start + int(FIVE_HOUR * 3600_000)
         fh_horizon = max(0.0, (fh_resets_by - now_ms) / 3600_000)
     else:
-        fh_resets_by = None
+        fh_start = fh_resets_by = None
+        fh_how = None
         fh_horizon = FIVE_HOUR            # unknown start: ceiling, labeled "<=5h"
     five_h = _project(latest["fh"], fh_rate, fh_horizon)
 
@@ -456,6 +498,7 @@ def load_usage(path=None, now_ms=None):
             "pct": latest["fh"], "rate_per_h": round(fh_rate, 2),
             "window_h": FIVE_HOUR,
             "window_start_ms": fh_start,
+            "window_start_how": fh_how,     # "observed" | "estimated" | None
             "resets_by_ms": fh_resets_by,
             "horizon_h": round(fh_horizon, 2),
             **five_h,

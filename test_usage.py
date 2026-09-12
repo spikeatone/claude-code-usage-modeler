@@ -120,15 +120,17 @@ def test_anchor_all_gaps_uses_midpoint():
 def test_fh_window_start_from_idle_climb():
     # Idle (fh<=2) until t=1h, climbs from t=1h -> window started ~1h.
     samples = [_s(0, 1, 5), _s(1, 1, 5), _s(2, 20, 5), _s(3, 40, 5)]
-    start = U._fh_window_start(samples, 3 * H)
+    start, how = U._fh_window_start(samples, 3 * H)
     assert start == 1 * H, start
+    assert how == "observed", how
 
 
 def test_fh_window_start_after_drop():
     # Drop at t=2h (60 -> 4) then climbing: window re-opened at the drop.
     samples = [_s(0, 40, 5), _s(1, 60, 5), _s(2, 4, 5), _s(3, 15, 5)]
-    start = U._fh_window_start(samples, 3 * H)
+    start, how = U._fh_window_start(samples, 3 * H)
     assert start == 2 * H, start
+    assert how == "observed", how
 
 
 def test_fh_window_start_unknown_when_idle():
@@ -215,6 +217,36 @@ def test_anchor_tight_bracket_pins_the_time():
     a = U._weekly_anchor(resets)
     assert a["weekday"] == 1, a
     assert a["hour"] == 21 and abs(a["minute"]) <= 5, a
+
+
+def test_fh_window_start_extrapolates_across_a_gap():
+    # The real failure: sampling only began mid-window (machine asleep), so
+    # there is no reset drop and no idle->climb - fh is already at 5 and
+    # rising in the first sample. The old code returned None and the panel
+    # claimed a full fresh 5 hours for a window resetting in under an hour.
+    # Back-extrapolation must place the start BEFORE the first sample.
+    samples = [_s(1.0, 5, 20), _s(1.5, 9, 21), _s(2.0, 12, 22),
+               _s(2.5, 19, 23), _s(3.0, 25, 24)]
+    got = U._fh_window_start(samples, int(3 * H))
+    assert got is not None, "should extrapolate, not give up"
+    start, how = got
+    assert how == "estimated", how
+    assert start < samples[0]["t"], (start, samples[0]["t"])
+    # and never older than the window length itself
+    assert start >= 3 * H - int(U.FIVE_HOUR * H), start
+
+
+def test_fh_window_start_late_burst_does_not_delay_the_estimate():
+    # A burst near the end (steady climb, then a spike) inflates the average
+    # rate and would push the estimated start LATER - i.e. claim more time
+    # than the window has. Fitting the early part keeps it honest.
+    steady = [_s(1.0, 6, 20), _s(1.5, 9, 20), _s(2.0, 12, 21), _s(2.5, 15, 21)]
+    burst = steady + [_s(2.75, 30, 22), _s(3.0, 45, 23)]
+    s_start, _ = U._fh_window_start(steady, int(2.5 * H))
+    b_start, _ = U._fh_window_start(burst, int(3 * H))
+    # The burst run must not place the window start materially later than the
+    # steady run did (allow a few minutes of drift).
+    assert b_start <= s_start + int(0.25 * H), (s_start, b_start)
 
 
 def run():

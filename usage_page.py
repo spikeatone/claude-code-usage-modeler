@@ -685,8 +685,15 @@ function render() {
   var fiveHorizon = five.horizon_h != null ? five.horizon_h : five.window_h;
   var fiveState = project(five.pct, fiveRateEff, fiveHorizon);
 
+  // Label the 5h reset honestly: "observed" means we saw the window open
+  // (a reset drop or an idle->climb); "estimated" means sampling only began
+  // mid-window - common, since Claude Code samples only while running - and
+  // the start was back-extrapolated from the climb rate, so it carries a
+  // rough-order tilde and an "est." marker.
   var fiveReset = five.resets_by_ms
-      ? ("by ~" + fmtWhen(five.resets_by_ms))
+      ? ((five.window_start_how === "estimated" ? "~" : "by ~") +
+         fmtWhen(five.resets_by_ms) +
+         (five.window_start_how === "estimated" ? " (est.)" : ""))
       : "\u22645h (window start unknown)";
   var fivePanel = panelHTML("5-hour session window", {
     pct: five.pct, rate: fiveRateEff, rateDp: 1,
