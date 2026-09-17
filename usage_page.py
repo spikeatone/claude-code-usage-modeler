@@ -97,6 +97,26 @@ PAGE = r"""<!doctype html>
     background:none; border:1px solid var(--line); border-radius:7px;
     padding:3px 10px; cursor:pointer; }
   .manual button:hover { border-color:var(--accent); color:var(--accent); }
+  /* manual current-reading entry - the primary input */
+  .entry { background:var(--card); border:1px solid var(--line); border-radius:14px;
+    padding:16px 20px; margin-bottom:16px; }
+  .entry h2 { font-size:13px; margin:0 0 4px; text-transform:uppercase;
+    letter-spacing:.05em; color:var(--muted); font-weight:600; }
+  .entry .hint { color:var(--muted); font-size:12.5px; margin-bottom:12px; max-width:74ch; }
+  .entry-row { display:flex; gap:22px; flex-wrap:wrap; align-items:flex-end; }
+  .entry-field { display:flex; flex-direction:column; gap:4px; }
+  .entry-field label { font-size:11px; text-transform:uppercase; letter-spacing:.04em;
+    color:var(--muted); font-weight:600; }
+  .entry-field input { font:inherit; font-size:16px; width:88px; color:var(--ink);
+    background:var(--bg); border:1px solid var(--line); border-radius:8px;
+    padding:7px 10px; font-variant-numeric:tabular-nums; }
+  .entry-field input:focus { outline:none; border-color:var(--accent); }
+  .entry .src { font-size:11.5px; color:var(--muted); margin-top:2px; }
+  .entry .src.typed { color:var(--ready); }
+  .entry-clear { font:inherit; font-size:12px; color:var(--muted); background:none;
+    border:1px solid var(--line); border-radius:7px; padding:5px 12px; cursor:pointer;
+    align-self:center; }
+  .entry-clear:hover { border-color:var(--accent); color:var(--accent); }
   /* live activity: which session is burning tokens right now */
   .livecard { margin-top:16px; background:var(--card); border:1px solid var(--line);
     border-radius:14px; padding:18px 20px; }
@@ -370,7 +390,8 @@ function panelHTML(title, meta, state) {
                   state.verdict === "over" ? "warn" : (state.verdict === "clear" ? "good" : ""));
   return '<div class="panel">' +
     '<h2>' + title + '<span class="pill ' + cls + '">' + state.verdict + '</span></h2>' +
-    '<div class="pct tabnum">' + Math.round(meta.pct) + '<small>%</small></div>' +
+    '<div class="pct tabnum">' + Math.round(meta.pct) + '<small>%</small>' +
+      (meta.pctNote ? '<small style="font-size:11px;color:var(--ready);margin-left:8px;text-transform:none;letter-spacing:0">\u25cf ' + meta.pctNote + '</small>' : '') + '</div>' +
     barHTML(meta.pct, state.pctAtReset, cls) +
     '<div class="barnote"><span>now ' + Math.round(meta.pct) + '%</span>' +
       '<span>' + (projShow == null ? '' : ('projected ' + Math.min(100, projShow) + '%' + (projShow > 100 ? '+' : ''))) + '</span>' +
@@ -541,6 +562,46 @@ function pollNow() {
 // user types it; we stamp when, because a typed number goes stale in a way a
 // sampled one doesn't - past ~6h we stop letting it drive the verdict.
 var BOOST_KEY = "usage.boostUntil";      // ISO date, e.g. "2026-09-13"
+// Manually-entered current readings, straight off /usage. These are the
+// PRIMARY input now: the local history file (plan-usage-history.json) is a
+// snapshot Claude Code flushes on its own erratic schedule and can lag by
+// days, so a number you typed 30 seconds ago beats a file sample from
+// Monday. Each reading is stamped; when a typed value is newer than the
+// file's latest sample, it overrides for that window and drives the gauge,
+// the projection and the verdict. The file stays as the fallback and as the
+// source of burn-rate, reset timing and history.
+var LIVE_FH_KEY = "usage.liveFh", LIVE_FH_AT = "usage.liveFhAt";
+var LIVE_SD_KEY = "usage.liveSd", LIVE_SD_AT = "usage.liveSdAt";
+
+function readLive(key, atKey) {
+  try {
+    var v = parseFloat(localStorage.getItem(key));
+    var at = parseFloat(localStorage.getItem(atKey));
+    if (!isFinite(v)) return null;
+    return { pct: Math.max(0, Math.min(100, v)), at: isFinite(at) ? at : null };
+  } catch (e) { return null; }
+}
+function writeLive(key, atKey, pct) {
+  try {
+    if (pct == null || !isFinite(pct)) {
+      localStorage.removeItem(key); localStorage.removeItem(atKey);
+    } else {
+      localStorage.setItem(key, Math.max(0, Math.min(100, pct)));
+      localStorage.setItem(atKey, Date.now());
+    }
+  } catch (e) {}
+}
+// A typed reading overrides the file only while it is BOTH newer than the
+// file's latest sample and not itself ancient (12h) - so a stale paste from
+// yesterday doesn't quietly outrank a fresh file flush.
+function liveOverride(reading, fileSampleMs) {
+  if (!reading || reading.at == null) return null;
+  var ageH = (Date.now() - reading.at) / 3600000;
+  if (ageH > 12) return null;
+  if (fileSampleMs && reading.at <= fileSampleMs) return null;
+  return reading;
+}
+
 var FABLE_KEY = "usage.fablePct", FABLE_AT = "usage.fablePctAt";
 var FABLE_STALE_H = 6;
 
@@ -638,10 +699,45 @@ function liveHTML(rows) {
     '<div class="hint">' + note + '</div>' + body + '</div>';
 }
 
+// The manual-entry card - the primary, trustworthy input. You read /usage
+// anyway; paste the two percentages and the gauges run off truth instead of
+// a file that can lag for days. Each field shows whether the value in play
+// came from your typing or from the (possibly stale) file.
+function liveEntryHTML(ovFh, ovSd, srcFh, srcSd, fivePct, sevenPct) {
+  function field(id, label, val, src) {
+    var srcTxt = src === "typed" ? "using your entry" : "from file (may be stale)";
+    return '<div class="entry-field"><label>' + label + '</label>' +
+      '<input type="number" id="' + id + '" min="0" max="100" step="1" ' +
+      'inputmode="numeric" placeholder="\u2014" value="' + (val != null ? Math.round(val) : "") + '">' +
+      '<span class="src ' + (src === "typed" ? "typed" : "") + '">' + srcTxt + '</span></div>';
+  }
+  return '<div class="entry"><h2>Current readings</h2>' +
+    '<div class="hint">Type the numbers from Claude Code&rsquo;s <code>/usage</code> popup. ' +
+    'These drive the gauges directly &mdash; the local history file lags, so a value you just ' +
+    'typed always wins over an older file sample. Leave blank to fall back to the file.</div>' +
+    '<div class="entry-row">' +
+      field("f-live-fh", "5-hour %", ovFh ? ovFh.pct : (srcFh === "file" ? fivePct : null), srcFh) +
+      field("f-live-sd", "Weekly %", ovSd ? ovSd.pct : (srcSd === "file" ? sevenPct : null), srcSd) +
+      ((ovFh || ovSd) ? '<button type="button" class="entry-clear" id="f-live-clear">clear entries</button>' : '') +
+    '</div></div>';
+}
+
 function render() {
   var app = document.getElementById("app");
   if (!MODEL || !MODEL.available) { renderOnboarding(app); return; }
   var five = MODEL.five_hour, seven = MODEL.seven_day;
+
+  // Manual readings straight off /usage take priority over the file when they
+  // are newer than the file's latest sample (see liveOverride). They replace
+  // only the current PERCENTAGE - burn rate, reset timing and history still
+  // come from the file, which is fine: those change slowly, it's the live %
+  // that goes stale. `srcFh`/`srcSd` record which source won, for the labels.
+  var fileMs = MODEL.latest_sample_ms || 0;
+  var ovFh = liveOverride(readLive(LIVE_FH_KEY, LIVE_FH_AT), fileMs);
+  var ovSd = liveOverride(readLive(LIVE_SD_KEY, LIVE_SD_AT), fileMs);
+  var srcFh = "file", srcSd = "file";
+  if (ovFh) { five = Object.assign({}, five, {pct: ovFh.pct}); srcFh = "typed"; }
+  if (ovSd) { seven = Object.assign({}, seven, {pct: ovSd.pct}); srcSd = "typed"; }
 
   // read controls. On first paint the inputs don't exist yet, so restore the
   // last session's values from localStorage (falling back to defaults: Opus at
@@ -697,14 +793,16 @@ function render() {
       : "\u22645h (window start unknown)";
   var fivePanel = panelHTML("5-hour session window", {
     pct: five.pct, rate: fiveRateEff, rateDp: 1,
-    hoursToReset: fiveHorizon, resetLabel: fiveReset
+    hoursToReset: fiveHorizon, resetLabel: fiveReset,
+    pctNote: srcFh === "typed" ? "your entry" : null
   }, fiveState);
   var sevenPanel = panelHTML("7-day weekly window", {
     pct: seven.pct, rate: sevenRateEff, rateDp: 2,
     rateNote: rateReliable ? null : ("measuring \u2014 " +
       (actObj ? actObj.active_hours + "h active so far this week" : "no active time yet")),
     rateLabel: "Planned pace", rate2: burst * mult,
-    hoursToReset: seven.hours_to_reset, resetLabel: fmtWhen(seven.next_reset_ms)
+    hoursToReset: seven.hours_to_reset, resetLabel: fmtWhen(seven.next_reset_ms),
+    pctNote: srcSd === "typed" ? "your entry" : null
   }, sevenState);
 
   // Third gauge: the manually-entered per-model weekly cap. It shares the
@@ -769,13 +867,22 @@ function render() {
   // Staleness: sampling stops whenever Claude Code isn't running, and stale
   // percentages presented as "now" were a real inaccuracy. Chip when fresh,
   // banner when old.
+  // Staleness is the NORMAL state here, not a fault: Claude Code writes
+  // plan-usage-history.json only when it feels like it (seen 5 min apart and
+  // 10+ hours apart), and nothing external can make it sample. So the banner
+  // is worded calmly and names the single action that unfreezes it - opening
+  // /usage in any live Claude session writes a fresh sample - rather than
+  // reading like the page is broken. The page also re-fetches itself (see the
+  // poll near the bottom), so a stale reading heals on its own once Claude
+  // Code writes again; no reload needed.
   var ageMin = MODEL.data_age_min != null ? MODEL.data_age_min : 0;
   var staleHtml = "";
   if (ageMin > 30) {
     var ageTxt = ageMin >= 90 ? (Math.round(ageMin / 6) / 10 + " h") : (Math.round(ageMin) + " min");
-    staleHtml = '<div class="stale-banner">Data is <b>' + ageTxt + ' old</b> — Claude Code ' +
-      'hasn&rsquo;t sampled since ' + fmtWhen(MODEL.latest_sample_ms) +
-      '. Percentages are as of then; time-to-reset is current.</div>';
+    staleHtml = '<div class="stale-banner">Percentages are from <b>' + fmtWhen(MODEL.latest_sample_ms) +
+      '</b> (' + ageTxt + ' ago) — Claude Code only records usage while it&rsquo;s running, and hasn&rsquo;t since. ' +
+      'Time-to-reset below is live. To refresh the percentages, run <code>/usage</code> in any Claude Code session; ' +
+      'this page picks it up on its own.</div>';
   }
 
   var boost = readBoost();
@@ -795,6 +902,7 @@ function render() {
   }
 
   app.innerHTML =
+    liveEntryHTML(ovFh, ovSd, srcFh, srcSd, MODEL.five_hour.pct, MODEL.seven_day.pct) +
     boostHtml + staleHtml +
     verdictBand(worst, fiveState, sevenState) +
     '<div class="' + (fablePanel ? "cols3" : "cols") + '">' +
@@ -865,6 +973,28 @@ function render() {
   // then replaces the whole panel via innerHTML and destroys the field
   // mid-typing, freezing that partial year in. So: commit on blur (or Enter),
   // and reject a year that's obviously incomplete rather than storing it.
+  ["f-live-fh", "f-live-sd"].forEach(function (id) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    var key = id === "f-live-fh" ? LIVE_FH_KEY : LIVE_SD_KEY;
+    var atKey = id === "f-live-fh" ? LIVE_FH_AT : LIVE_SD_AT;
+    var commit = function () {
+      var v = parseFloat(el.value);
+      writeLive(key, atKey, isFinite(v) ? v : null);
+      render();
+    };
+    el.addEventListener("blur", commit);
+    el.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); el.blur(); }
+    });
+  });
+  var lClear = document.getElementById("f-live-clear");
+  if (lClear) lClear.addEventListener("click", function () {
+    writeLive(LIVE_FH_KEY, LIVE_FH_AT, null);
+    writeLive(LIVE_SD_KEY, LIVE_SD_AT, null);
+    render();
+  });
+
   var bEl = document.getElementById("f-boost");
   if (bEl) {
     var commitBoost = function () {
