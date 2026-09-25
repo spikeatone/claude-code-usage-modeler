@@ -117,6 +117,9 @@ PAGE = r"""<!doctype html>
     border:1px solid var(--line); border-radius:7px; padding:5px 12px; cursor:pointer;
     align-self:center; }
   .entry-clear:hover { border-color:var(--accent); color:var(--accent); }
+  .entry-collapsed { display:flex; align-items:center; justify-content:space-between;
+    gap:14px; flex-wrap:wrap; padding:12px 20px; }
+  .entry-collapsed .entry-ok { color:var(--ready); font-size:13px; }
   /* live activity: which session is burning tokens right now */
   .livecard { margin-top:16px; background:var(--card); border:1px solid var(--line);
     border-radius:14px; padding:18px 20px; }
@@ -703,22 +706,43 @@ function liveHTML(rows) {
 // anyway; paste the two percentages and the gauges run off truth instead of
 // a file that can lag for days. Each field shows whether the value in play
 // came from your typing or from the (possibly stale) file.
-function liveEntryHTML(ovFh, ovSd, srcFh, srcSd, fivePct, sevenPct) {
+function liveEntryHTML(ovFh, ovSd, srcFh, srcSd, fivePct, sevenPct, ageMin) {
+  // The file now refreshes on a ~15-min cadence and the page auto-polls, so
+  // manual entry is a fallback, not the main event. When data is fresh and you
+  // haven't overridden anything, this collapses to one quiet line with a
+  // "correct these" toggle. It expands automatically when the data is stale
+  // (>30 min) or when an override is active - i.e. exactly when typing helps.
+  var haveOverride = !!(ovFh || ovSd);
+  var stale = ageMin != null && ageMin > 30;
+  var expanded = haveOverride || stale;
+
   function field(id, label, val, src) {
-    var srcTxt = src === "typed" ? "using your entry" : "from file (may be stale)";
+    var srcTxt = src === "typed" ? "using your entry" : "from file";
     return '<div class="entry-field"><label>' + label + '</label>' +
       '<input type="number" id="' + id + '" min="0" max="100" step="1" ' +
       'inputmode="numeric" placeholder="\u2014" value="' + (val != null ? Math.round(val) : "") + '">' +
       '<span class="src ' + (src === "typed" ? "typed" : "") + '">' + srcTxt + '</span></div>';
   }
+
+  if (!expanded) {
+    // Collapsed: fresh file, no override. One line, no inputs in the way.
+    return '<div class="entry entry-collapsed">' +
+      '<span class="entry-ok">\u25cf Live from the usage file, updated ' +
+      (ageMin < 1 ? "just now" : Math.round(ageMin) + " min ago") +
+      ' \u2014 auto-refreshing.</span>' +
+      '<button type="button" class="entry-clear" id="f-live-open">correct from /usage</button>' +
+      '</div>';
+  }
+
+  var why = stale
+    ? 'The usage file hasn&rsquo;t updated in a while. Paste the current numbers from Claude Code&rsquo;s <code>/usage</code> popup and the gauges use them until the file catches up.'
+    : 'Using the numbers you typed. Clear them to fall back to the (auto-refreshing) usage file.';
   return '<div class="entry"><h2>Current readings</h2>' +
-    '<div class="hint">Type the numbers from Claude Code&rsquo;s <code>/usage</code> popup. ' +
-    'These drive the gauges directly &mdash; the local history file lags, so a value you just ' +
-    'typed always wins over an older file sample. Leave blank to fall back to the file.</div>' +
+    '<div class="hint">' + why + '</div>' +
     '<div class="entry-row">' +
       field("f-live-fh", "5-hour %", ovFh ? ovFh.pct : (srcFh === "file" ? fivePct : null), srcFh) +
       field("f-live-sd", "Weekly %", ovSd ? ovSd.pct : (srcSd === "file" ? sevenPct : null), srcSd) +
-      ((ovFh || ovSd) ? '<button type="button" class="entry-clear" id="f-live-clear">clear entries</button>' : '') +
+      (haveOverride ? '<button type="button" class="entry-clear" id="f-live-clear">clear entries</button>' : '') +
     '</div></div>';
 }
 
@@ -902,7 +926,7 @@ function render() {
   }
 
   app.innerHTML =
-    liveEntryHTML(ovFh, ovSd, srcFh, srcSd, MODEL.five_hour.pct, MODEL.seven_day.pct) +
+    liveEntryHTML(ovFh, ovSd, srcFh, srcSd, MODEL.five_hour.pct, MODEL.seven_day.pct, MODEL.data_age_min) +
     boostHtml + staleHtml +
     verdictBand(worst, fiveState, sevenState) +
     '<div class="' + (fablePanel ? "cols3" : "cols") + '">' +
@@ -988,6 +1012,16 @@ function render() {
       if (e.key === "Enter") { e.preventDefault(); el.blur(); }
     });
   });
+  var lOpen = document.getElementById("f-live-open");
+  if (lOpen) lOpen.addEventListener("click", function () {
+    // Seed the override store with the file's current values (stamped now) so
+    // liveEntryHTML sees an override and expands, pre-filled for editing.
+    if (MODEL.five_hour) writeLive(LIVE_FH_KEY, LIVE_FH_AT, Math.round(MODEL.five_hour.pct));
+    if (MODEL.seven_day) writeLive(LIVE_SD_KEY, LIVE_SD_AT, Math.round(MODEL.seven_day.pct));
+    render();
+    var el = document.getElementById("f-live-fh");
+    if (el) { el.focus(); el.select(); }
+  });
   var lClear = document.getElementById("f-live-clear");
   if (lClear) lClear.addEventListener("click", function () {
     writeLive(LIVE_FH_KEY, LIVE_FH_AT, null);
@@ -1038,6 +1072,38 @@ function render() {
 
 window.addEventListener("resize", function () { drawChart(MODEL.history); });
 render();
+
+// Auto-refresh. The history file now updates on a fairly steady ~15-min
+// cadence (the multi-day freezes that made this useless are rarer), so the
+// page can keep itself current instead of needing a manual reload. Every 2
+// min we re-fetch the model and, only if the data actually moved, re-render.
+// Two guards keep it from fighting the user: skip entirely while any input is
+// focused (never yank a half-typed entry out from under the caret), and keep
+// the poll purely additive - typed overrides live in localStorage and are
+// re-applied by render(), so a refresh never discards them.
+(function autoRefresh() {
+  var REFRESH_MS = 120000;
+  function anInputIsFocused() {
+    var a = document.activeElement;
+    return a && (a.tagName === "INPUT" || a.tagName === "TEXTAREA");
+  }
+  setInterval(function () {
+    if (anInputIsFocused()) return;
+    fetch("/api/usage", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (fresh) {
+        if (!fresh || !fresh.available) return;
+        // Only repaint when the underlying sample changed - avoids a needless
+        // re-render (and chart reflow) every 2 min when nothing moved.
+        var changed = !MODEL || !MODEL.available ||
+          fresh.latest_sample_ms !== MODEL.latest_sample_ms ||
+          fresh.now_ms !== MODEL.now_ms;
+        MODEL = fresh;
+        if (changed && !anInputIsFocused()) render();
+      })
+      .catch(function () { /* transient - try again next tick */ });
+  }, REFRESH_MS);
+})();
 
 var foot = document.getElementById("foot");
 if (MODEL && MODEL.available) {
